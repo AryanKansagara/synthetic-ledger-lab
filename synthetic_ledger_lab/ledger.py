@@ -65,8 +65,15 @@ class Ledger:
             return True
 
     def balance(self, account: str) -> int:
+        """Return an account balance without SQLite aggregate overflow.
+
+        Individual postings fit SQLite's signed 64-bit INTEGER type, but an
+        account's running total may not. Sum in Python so valid histories stay
+        readable after crossing that boundary.
+        """
         with sqlite3.connect(self.path) as db:
-            return db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM postings WHERE account = ?",
+            amounts = db.execute(
+                "SELECT amount FROM postings WHERE account = ?",
                 (account,),
-            ).fetchone()[0]
+            )
+            return sum(amount for (amount,) in amounts)

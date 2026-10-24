@@ -46,6 +46,14 @@ class LedgerTests(unittest.TestCase):
             self.ledger.post("", [("a", -1), ("b", 1)])
         self.assertEqual(self.ledger.balance("a"), 0)
 
+    def test_balance_can_exceed_sqlite_signed_integer_range(self):
+        maximum = 2**63 - 1
+        self.ledger.post("tx-1", [("clearing-1", -maximum), ("wallet", maximum)])
+        self.ledger.post("tx-2", [("clearing-2", -maximum), ("wallet", maximum)])
+
+        self.assertEqual(self.ledger.balance("wallet"), 2 * maximum)
+        self.assertEqual(self.ledger.balance("missing"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
