@@ -15,8 +15,24 @@ ledger.post("synthetic-transfer-001", [("demo-wallet", -250), ("merchant", 250)]
 assert ledger.balance("demo-wallet") == 750
 ```
 
+## Reconciliation export
+
+`Ledger.export_reconciliation_csv(path)` writes an atomic, deterministic CSV
+snapshot ordered by transaction and account. It returns the posting row count
+and SHA-256 digest so a downstream synthetic reconciliation job can verify the
+artifact after transfer:
+
+```python
+snapshot = ledger.export_reconciliation_csv("reconciliation.csv")
+print(snapshot.row_count, snapshot.sha256)
+```
+
+CSV fields use standard quoting, amounts remain integer minor units, and the
+export refuses to overwrite the SQLite ledger itself. This is a portable
+posting-level artifact, not a cryptographic signature or proof of authenticity.
+
 Run: `python3 -m unittest discover -s tests -v` (Python standard library only).
 
 Tests run locally and in GitHub Actions on Python 3.11 and 3.14.
 
-This is an educational ledger core, not a payment system. Negative balances are currently allowed (e.g. external clearing); account-level overdraft policies, cross-system reconciliation, signatures and audit exports are future work. Each transaction uses distinct accounts and an ordered payload; reordering otherwise equivalent postings counts as a conflict.
+This is an educational ledger core, not a payment system. Negative balances are currently allowed (e.g. external clearing); account-level overdraft policies, import-side reconciliation and signed audit exports are future work. Each transaction uses distinct accounts and an ordered payload; reordering otherwise equivalent postings counts as a conflict.
