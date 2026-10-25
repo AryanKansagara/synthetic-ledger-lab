@@ -1,3 +1,5 @@
+import csv
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +55,49 @@ class LedgerTests(unittest.TestCase):
 
         self.assertEqual(self.ledger.balance("wallet"), 2 * maximum)
         self.assertEqual(self.ledger.balance("missing"), 0)
+
+    def test_reconciliation_export_is_deterministic_and_checksummed(self):
+        self.ledger.post("tx-z", [("wallet", -250), ("merchant", 250)])
+        self.ledger.post("tx-a", [("clearing", -1000), ("wallet", 1000)])
+        destination = Path(self.tmp.name) / "snapshot.csv"
+
+        result = self.ledger.export_reconciliation_csv(destination)
+        payload = destination.read_bytes()
+
+        self.assertEqual(result.path, destination)
+        self.assertEqual(result.row_count, 4)
+        self.assertEqual(result.sha256, hashlib.sha256(payload).hexdigest())
+        with destination.open(newline="") as export_file:
+            self.assertEqual(
+                list(csv.reader(export_file)),
+                [
+                    ["transaction_id", "account", "amount_minor"],
+                    ["tx-a", "clearing", "-1000"],
+                    ["tx-a", "wallet", "1000"],
+                    ["tx-z", "merchant", "250"],
+                    ["tx-z", "wallet", "-250"],
+                ],
+            )
+
+        second = self.ledger.export_reconciliation_csv(destination)
+        self.assertEqual(second.sha256, result.sha256)
+
+    def test_reconciliation_export_quotes_accounts_and_protects_database(self):
+        self.ledger.post("tx-1", [("account,with-comma", -5), ("wallet\nline", 5)])
+        destination = Path(self.tmp.name) / "snapshot.csv"
+        result = self.ledger.export_reconciliation_csv(destination)
+
+        with destination.open(newline="") as export_file:
+            rows = list(csv.reader(export_file))
+        self.assertEqual(
+            rows[1:],
+            [["tx-1", "account,with-comma", "-5"], ["tx-1", "wallet\nline", "5"]],
+        )
+        self.assertEqual(result.row_count, 2)
+
+        with self.assertRaisesRegex(ValueError, "must not overwrite"):
+            self.ledger.export_reconciliation_csv(self.path)
+        self.assertEqual(self.ledger.balance("wallet\nline"), 5)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,23 @@
 """Synthetic double-entry ledger with atomic, idempotent postings."""
 
+import csv
+import hashlib
+import io
 import json
+import os
 import sqlite3
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class ReconciliationExport:
+    """Metadata for a deterministic reconciliation artifact."""
+
+    path: Path
+    row_count: int
+    sha256: str
 
 
 class Ledger:
@@ -77,3 +92,51 @@ class Ledger:
                 (account,),
             )
             return sum(amount for (amount,) in amounts)
+
+    def export_reconciliation_csv(self, destination: str | Path) -> ReconciliationExport:
+        """Atomically write a deterministic posting-level CSV snapshot.
+
+        Rows are sorted independently of insertion order. The returned SHA-256
+        digest lets a downstream reconciliation process verify that the file it
+        received is byte-for-byte identical to the exported artifact.
+        """
+        destination = Path(destination)
+        if destination.resolve() == self.path.resolve():
+            raise ValueError("export destination must not overwrite the ledger")
+
+        with sqlite3.connect(self.path) as db:
+            rows = db.execute(
+                """SELECT tx_id, account, amount
+                   FROM postings
+                   ORDER BY tx_id, account"""
+            ).fetchall()
+
+        text = io.StringIO(newline="")
+        writer = csv.writer(text, lineterminator="\n")
+        writer.writerow(("transaction_id", "account", "amount_minor"))
+        writer.writerows(rows)
+        payload = text.getvalue().encode("utf-8")
+
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as export_file:
+                export_file.write(payload)
+                export_file.flush()
+                os.fsync(export_file.fileno())
+            os.replace(temporary_path, destination)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+        return ReconciliationExport(
+            path=destination,
+            row_count=len(rows),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
