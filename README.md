@@ -25,14 +25,24 @@ artifact after transfer:
 ```python
 snapshot = ledger.export_reconciliation_csv("reconciliation.csv")
 print(snapshot.row_count, snapshot.sha256)
+
+# At the receiving side, verify transfer integrity and compare without mutation.
+report = ledger.reconcile_csv(
+    "reconciliation.csv", expected_sha256=snapshot.sha256
+)
+assert report.matched
 ```
 
 CSV fields use standard quoting, amounts remain integer minor units, and the
 export refuses to overwrite the SQLite ledger itself. This is a portable
 posting-level artifact, not a cryptographic signature or proof of authenticity.
+Imports are strictly validated (UTF-8, exact header, canonical signed 64-bit
+minor-unit amounts, unique transaction/account pairs) and limited to 10 MiB.
+Mismatch reports deterministically identify changed, missing and unexpected
+postings. Reconciliation reads never post transactions or mutate balances.
 
 Run: `python3 -m unittest discover -s tests -v` (Python standard library only).
 
 Tests run locally and in GitHub Actions on Python 3.11 and 3.14.
 
-This is an educational ledger core, not a payment system. Negative balances are currently allowed (e.g. external clearing); account-level overdraft policies, import-side reconciliation and signed audit exports are future work. Each transaction uses distinct accounts and an ordered payload; reordering otherwise equivalent postings counts as a conflict.
+This is an educational ledger core, not a payment system. Negative balances are currently allowed (e.g. external clearing); account-level overdraft policies and signed audit exports are future work. Each transaction uses distinct accounts and an ordered payload; reordering otherwise equivalent postings counts as a conflict.
