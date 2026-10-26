@@ -2,9 +2,11 @@
 
 import csv
 import hashlib
+import hmac
 import io
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -18,6 +20,32 @@ class ReconciliationExport:
     path: Path
     row_count: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class ReconciliationDifference:
+    """One posting that differs between the ledger and an imported snapshot."""
+
+    transaction_id: str
+    account: str
+    ledger_amount: int | None
+    imported_amount: int | None
+
+
+@dataclass(frozen=True)
+class ReconciliationReport:
+    """Result of comparing an imported artifact with the current ledger."""
+
+    path: Path
+    row_count: int
+    sha256: str
+    matched: bool
+    differences: tuple[ReconciliationDifference, ...]
+
+
+_RECONCILIATION_HEADER = ("transaction_id", "account", "amount_minor")
+_CANONICAL_INTEGER = re.compile(r"-?[1-9][0-9]*\Z")
+_MAX_RECONCILIATION_BYTES = 10 * 1024 * 1024
 
 
 class Ledger:
@@ -113,7 +141,7 @@ class Ledger:
 
         text = io.StringIO(newline="")
         writer = csv.writer(text, lineterminator="\n")
-        writer.writerow(("transaction_id", "account", "amount_minor"))
+        writer.writerow(_RECONCILIATION_HEADER)
         writer.writerows(rows)
         payload = text.getvalue().encode("utf-8")
 
@@ -139,4 +167,90 @@ class Ledger:
             path=destination,
             row_count=len(rows),
             sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    def reconcile_csv(
+        self,
+        source: str | Path,
+        *,
+        expected_sha256: str | None = None,
+    ) -> ReconciliationReport:
+        """Validate and compare a reconciliation CSV without mutating the ledger.
+
+        When supplied, ``expected_sha256`` is checked before parsing so transfer
+        corruption is distinguishable from a legitimate ledger discrepancy.
+        Differences are ordered by transaction ID and account for stable reports.
+        """
+        source = Path(source)
+        with source.open("rb") as reconciliation_file:
+            payload = reconciliation_file.read(_MAX_RECONCILIATION_BYTES + 1)
+        if len(payload) > _MAX_RECONCILIATION_BYTES:
+            raise ValueError("reconciliation CSV exceeds 10 MiB limit")
+        digest = hashlib.sha256(payload).hexdigest()
+        if expected_sha256 is not None:
+            if not isinstance(expected_sha256, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", expected_sha256
+            ):
+                raise ValueError("expected_sha256 must be a 64-character hex digest")
+            if not hmac.compare_digest(digest, expected_sha256.lower()):
+                raise ValueError("reconciliation CSV checksum mismatch")
+
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("reconciliation CSV must be UTF-8") from error
+
+        try:
+            reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+            header = next(reader, None)
+            if header != list(_RECONCILIATION_HEADER):
+                raise ValueError("invalid reconciliation CSV header")
+
+            imported: dict[tuple[str, str], int] = {}
+            for line_number, row in enumerate(reader, start=2):
+                if len(row) != 3:
+                    raise ValueError(f"line {line_number} must contain exactly 3 fields")
+                transaction_id, account, raw_amount = row
+                if not transaction_id.strip() or not account.strip():
+                    raise ValueError(
+                        f"line {line_number} transaction and account must be non-empty"
+                    )
+                if _CANONICAL_INTEGER.fullmatch(raw_amount) is None:
+                    raise ValueError(f"line {line_number} has an invalid amount")
+                amount = int(raw_amount)
+                if not -(2**63) <= amount < 2**63 or amount == 0:
+                    raise ValueError(
+                        f"line {line_number} amount must be a non-zero signed 64-bit integer"
+                    )
+                key = (transaction_id, account)
+                if key in imported:
+                    raise ValueError(f"line {line_number} duplicates a posting")
+                imported[key] = amount
+        except csv.Error as error:
+            raise ValueError("malformed reconciliation CSV") from error
+
+        with sqlite3.connect(self.path) as db:
+            ledger = {
+                (transaction_id, account): amount
+                for transaction_id, account, amount in db.execute(
+                    "SELECT tx_id, account, amount FROM postings"
+                )
+            }
+
+        differences = tuple(
+            ReconciliationDifference(
+                transaction_id=key[0],
+                account=key[1],
+                ledger_amount=ledger.get(key),
+                imported_amount=imported.get(key),
+            )
+            for key in sorted(ledger.keys() | imported.keys())
+            if ledger.get(key) != imported.get(key)
+        )
+        return ReconciliationReport(
+            path=source,
+            row_count=len(imported),
+            sha256=digest,
+            matched=not differences,
+            differences=differences,
         )

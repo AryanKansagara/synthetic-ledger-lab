@@ -99,6 +99,67 @@ class LedgerTests(unittest.TestCase):
             self.ledger.export_reconciliation_csv(self.path)
         self.assertEqual(self.ledger.balance("wallet\nline"), 5)
 
+    def test_reconciliation_import_matches_export_and_verifies_checksum(self):
+        self.ledger.post("tx-1", [("clearing", -500), ("wallet", 500)])
+        source = Path(self.tmp.name) / "snapshot.csv"
+        exported = self.ledger.export_reconciliation_csv(source)
+
+        report = self.ledger.reconcile_csv(source, expected_sha256=exported.sha256.upper())
+
+        self.assertTrue(report.matched)
+        self.assertEqual(report.row_count, 2)
+        self.assertEqual(report.sha256, exported.sha256)
+        self.assertEqual(report.differences, ())
+
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            self.ledger.reconcile_csv(source, expected_sha256="0" * 64)
+
+    def test_reconciliation_import_reports_changed_missing_and_extra_postings(self):
+        self.ledger.post("tx-1", [("clearing", -500), ("wallet", 500)])
+        source = Path(self.tmp.name) / "external.csv"
+        source.write_text(
+            "transaction_id,account,amount_minor\n"
+            "tx-1,clearing,-499\n"
+            "tx-2,merchant,25\n",
+            encoding="utf-8",
+        )
+
+        report = self.ledger.reconcile_csv(source)
+
+        self.assertFalse(report.matched)
+        self.assertEqual(
+            [
+                (item.transaction_id, item.account, item.ledger_amount, item.imported_amount)
+                for item in report.differences
+            ],
+            [
+                ("tx-1", "clearing", -500, -499),
+                ("tx-1", "wallet", 500, None),
+                ("tx-2", "merchant", None, 25),
+            ],
+        )
+        self.assertEqual(self.ledger.balance("wallet"), 500)
+
+    def test_reconciliation_import_rejects_malformed_or_ambiguous_rows(self):
+        source = Path(self.tmp.name) / "invalid.csv"
+        cases = [
+            "wrong,header,names\n",
+            "transaction_id,account,amount_minor\ntx-1,a\n",
+            "transaction_id,account,amount_minor\ntx-1,a,0\n",
+            "transaction_id,account,amount_minor\ntx-1,a,+1\n",
+            "transaction_id,account,amount_minor\ntx-1,a,01\n",
+            "transaction_id,account,amount_minor\ntx-1,a,1\ntx-1,a,1\n",
+            f"transaction_id,account,amount_minor\ntx-1,a,{2**63}\n",
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                source.write_text(payload, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self.ledger.reconcile_csv(source)
+
+        with self.assertRaisesRegex(ValueError, "64-character hex"):
+            self.ledger.reconcile_csv(source, expected_sha256="not-a-digest")
+
 
 if __name__ == "__main__":
     unittest.main()
