@@ -33,9 +33,29 @@ report = ledger.reconcile_csv(
 assert report.matched
 ```
 
+For authenticity as well as transfer integrity, the exporter can produce a
+detached HMAC-SHA256 tag over the exact CSV bytes. The receiver verifies the tag
+before parsing or comparing any rows:
+
+```python
+shared_key = b"replace-with-at-least-32-secret-bytes"
+snapshot = ledger.export_reconciliation_csv(
+    "signed-reconciliation.csv", signing_key=shared_key
+)
+report = ledger.reconcile_csv(
+    "signed-reconciliation.csv",
+    expected_hmac_sha256=snapshot.hmac_sha256,
+    signing_key=shared_key,
+)
+assert report.matched
+```
+
 CSV fields use standard quoting, amounts remain integer minor units, and the
-export refuses to overwrite the SQLite ledger itself. This is a portable
-posting-level artifact, not a cryptographic signature or proof of authenticity.
+export refuses to overwrite the SQLite ledger itself. Unsigned exports are
+portable posting-level artifacts, not proofs of authenticity. Signed exports
+use a shared secret (minimum 32 bytes) and therefore provide integrity and
+authenticity, but not public-key signatures or non-repudiation; callers are
+responsible for secret storage, rotation and out-of-band tag transfer.
 Imports are strictly validated (UTF-8, exact header, canonical signed 64-bit
 minor-unit amounts, unique transaction/account pairs) and limited to 10 MiB.
 Mismatch reports deterministically identify changed, missing and unexpected
@@ -45,4 +65,4 @@ Run: `python3 -m unittest discover -s tests -v` (Python standard library only).
 
 Tests run locally and in GitHub Actions on Python 3.11 and 3.14.
 
-This is an educational ledger core, not a payment system. Negative balances are currently allowed (e.g. external clearing); account-level overdraft policies and signed audit exports are future work. Each transaction uses distinct accounts and an ordered payload; reordering otherwise equivalent postings counts as a conflict.
+This is an educational ledger core, not a payment system. Negative balances are currently allowed (e.g. external clearing); account-level overdraft policies are future work. Each transaction uses distinct accounts and an ordered payload; reordering otherwise equivalent postings counts as a conflict.
