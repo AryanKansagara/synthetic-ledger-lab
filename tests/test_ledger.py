@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import hmac
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +160,48 @@ class LedgerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "64-character hex"):
             self.ledger.reconcile_csv(source, expected_sha256="not-a-digest")
+
+    def test_signed_reconciliation_snapshot_authenticates_before_import(self):
+        self.ledger.post("tx-1", [("clearing", -500), ("wallet", 500)])
+        source = Path(self.tmp.name) / "signed.csv"
+        key = b"synthetic-reconciliation-key-32b"
+
+        exported = self.ledger.export_reconciliation_csv(source, signing_key=key)
+        payload = source.read_bytes()
+
+        self.assertEqual(
+            exported.hmac_sha256,
+            hmac.new(key, payload, hashlib.sha256).hexdigest(),
+        )
+        report = self.ledger.reconcile_csv(
+            source,
+            expected_sha256=exported.sha256,
+            expected_hmac_sha256=exported.hmac_sha256,
+            signing_key=key,
+        )
+        self.assertTrue(report.matched)
+
+        source.write_bytes(payload + b"tampered")
+        with self.assertRaisesRegex(ValueError, "authentication failed"):
+            self.ledger.reconcile_csv(
+                source,
+                expected_hmac_sha256=exported.hmac_sha256,
+                signing_key=key,
+            )
+
+    def test_signed_reconciliation_requires_complete_strong_credentials(self):
+        source = Path(self.tmp.name) / "snapshot.csv"
+        source.write_text("transaction_id,account,amount_minor\n", encoding="utf-8")
+        key = b"synthetic-reconciliation-key-32b"
+
+        with self.assertRaisesRegex(ValueError, "at least 32 bytes"):
+            self.ledger.export_reconciliation_csv(source, signing_key=b"too-short")
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            self.ledger.reconcile_csv(source, signing_key=key)
+        with self.assertRaisesRegex(ValueError, "64-character hex tag"):
+            self.ledger.reconcile_csv(
+                source, expected_hmac_sha256="invalid", signing_key=key
+            )
 
 
 if __name__ == "__main__":

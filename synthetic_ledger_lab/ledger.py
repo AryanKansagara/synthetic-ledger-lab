@@ -20,6 +20,7 @@ class ReconciliationExport:
     path: Path
     row_count: int
     sha256: str
+    hmac_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,11 @@ class ReconciliationReport:
 _RECONCILIATION_HEADER = ("transaction_id", "account", "amount_minor")
 _CANONICAL_INTEGER = re.compile(r"-?[1-9][0-9]*\Z")
 _MAX_RECONCILIATION_BYTES = 10 * 1024 * 1024
+
+
+def _validate_signing_key(signing_key: bytes) -> None:
+    if not isinstance(signing_key, bytes) or len(signing_key) < 32:
+        raise ValueError("signing_key must contain at least 32 bytes")
 
 
 class Ledger:
@@ -121,16 +127,24 @@ class Ledger:
             )
             return sum(amount for (amount,) in amounts)
 
-    def export_reconciliation_csv(self, destination: str | Path) -> ReconciliationExport:
+    def export_reconciliation_csv(
+        self,
+        destination: str | Path,
+        *,
+        signing_key: bytes | None = None,
+    ) -> ReconciliationExport:
         """Atomically write a deterministic posting-level CSV snapshot.
 
         Rows are sorted independently of insertion order. The returned SHA-256
         digest lets a downstream reconciliation process verify that the file it
-        received is byte-for-byte identical to the exported artifact.
+        received is byte-for-byte identical to the exported artifact. Supplying
+        a secret signing key also returns an HMAC-SHA256 authenticity tag.
         """
         destination = Path(destination)
         if destination.resolve() == self.path.resolve():
             raise ValueError("export destination must not overwrite the ledger")
+        if signing_key is not None:
+            _validate_signing_key(signing_key)
 
         with sqlite3.connect(self.path) as db:
             rows = db.execute(
@@ -167,6 +181,11 @@ class Ledger:
             path=destination,
             row_count=len(rows),
             sha256=hashlib.sha256(payload).hexdigest(),
+            hmac_sha256=(
+                hmac.new(signing_key, payload, hashlib.sha256).hexdigest()
+                if signing_key is not None
+                else None
+            ),
         )
 
     def reconcile_csv(
@@ -174,12 +193,16 @@ class Ledger:
         source: str | Path,
         *,
         expected_sha256: str | None = None,
+        expected_hmac_sha256: str | None = None,
+        signing_key: bytes | None = None,
     ) -> ReconciliationReport:
         """Validate and compare a reconciliation CSV without mutating the ledger.
 
         When supplied, ``expected_sha256`` is checked before parsing so transfer
         corruption is distinguishable from a legitimate ledger discrepancy.
-        Differences are ordered by transaction ID and account for stable reports.
+        HMAC verification requires both ``expected_hmac_sha256`` and the shared
+        ``signing_key`` and also occurs before parsing. Differences are ordered
+        by transaction ID and account for stable reports.
         """
         source = Path(source)
         with source.open("rb") as reconciliation_file:
@@ -194,6 +217,17 @@ class Ledger:
                 raise ValueError("expected_sha256 must be a 64-character hex digest")
             if not hmac.compare_digest(digest, expected_sha256.lower()):
                 raise ValueError("reconciliation CSV checksum mismatch")
+        if (expected_hmac_sha256 is None) != (signing_key is None):
+            raise ValueError("expected_hmac_sha256 and signing_key must be supplied together")
+        if signing_key is not None:
+            _validate_signing_key(signing_key)
+            if not isinstance(expected_hmac_sha256, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", expected_hmac_sha256
+            ):
+                raise ValueError("expected_hmac_sha256 must be a 64-character hex tag")
+            actual_hmac = hmac.new(signing_key, payload, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(actual_hmac, expected_hmac_sha256.lower()):
+                raise ValueError("reconciliation CSV authentication failed")
 
         try:
             text = payload.decode("utf-8")
