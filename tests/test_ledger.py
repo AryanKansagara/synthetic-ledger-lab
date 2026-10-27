@@ -1,9 +1,11 @@
 import csv
+import concurrent.futures
 import hashlib
 import hmac
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from synthetic_ledger_lab.ledger import Ledger
 
@@ -56,6 +58,85 @@ class LedgerTests(unittest.TestCase):
 
         self.assertEqual(self.ledger.balance("wallet"), 2 * maximum)
         self.assertEqual(self.ledger.balance("missing"), 0)
+
+    def test_minimum_balance_blocks_overdraft_without_mutation(self):
+        self.ledger.post("fund", [("clearing", -1000), ("wallet", 1000)])
+        self.ledger.set_minimum_balance("wallet", 0)
+
+        with self.assertRaisesRegex(ValueError, "minimum balance policy violated"):
+            self.ledger.post("overspend", [("wallet", -1001), ("merchant", 1001)])
+
+        self.assertEqual(self.ledger.balance("wallet"), 1000)
+        self.assertEqual(self.ledger.balance("merchant"), 0)
+        self.assertEqual(self.ledger.minimum_balance("wallet"), 0)
+
+        self.assertTrue(
+            self.ledger.post("spend", [("wallet", -1000), ("merchant", 1000)])
+        )
+        self.assertEqual(self.ledger.balance("wallet"), 0)
+
+    def test_minimum_balance_policy_persists_and_can_be_removed(self):
+        self.ledger.set_minimum_balance("wallet", 0)
+        reopened = Ledger(self.path)
+
+        self.assertEqual(reopened.minimum_balance("wallet"), 0)
+        self.assertIsNone(reopened.minimum_balance("clearing"))
+        reopened.set_minimum_balance("wallet", None)
+        self.assertIsNone(self.ledger.minimum_balance("wallet"))
+        self.assertTrue(
+            self.ledger.post("unrestricted", [("wallet", -1), ("clearing", 1)])
+        )
+
+    def test_minimum_balance_serializes_competing_spends(self):
+        self.ledger.post("fund", [("clearing", -1000), ("wallet", 1000)])
+        self.ledger.set_minimum_balance("wallet", 0)
+
+        def spend(sequence: int) -> str:
+            try:
+                Ledger(self.path).post(
+                    f"spend-{sequence}",
+                    [("wallet", -750), (f"merchant-{sequence}", 750)],
+                )
+                return "posted"
+            except ValueError as error:
+                return str(error)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(spend, (1, 2)))
+
+        self.assertEqual(outcomes.count("posted"), 1)
+        self.assertEqual(
+            sum("minimum balance policy violated" in outcome for outcome in outcomes),
+            1,
+        )
+        self.assertEqual(self.ledger.balance("wallet"), 250)
+        self.assertEqual(
+            self.ledger.balance("merchant-1") + self.ledger.balance("merchant-2"),
+            750,
+        )
+
+    def test_minimum_balance_cannot_be_raised_above_current_balance(self):
+        self.ledger.set_minimum_balance("wallet", -10)
+
+        with self.assertRaisesRegex(ValueError, "cannot exceed current balance"):
+            self.ledger.set_minimum_balance("wallet", 1)
+
+        self.assertEqual(self.ledger.minimum_balance("wallet"), -10)
+
+    def test_minimum_balance_validates_inputs_and_exact_replay_stays_idempotent(self):
+        self.ledger.post("fund", [("clearing", -5), ("wallet", 5)])
+        self.ledger.set_minimum_balance("wallet", 5)
+        self.assertFalse(
+            self.ledger.post("fund", [("clearing", -5), ("wallet", 5)])
+        )
+
+        invalid_values: tuple[Any, ...] = (True, 1.5, 2**63)
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.ledger.set_minimum_balance("wallet", invalid)
+        with self.assertRaises(ValueError):
+            self.ledger.set_minimum_balance("", 0)
 
     def test_reconciliation_export_is_deterministic_and_checksummed(self):
         self.ledger.post("tx-z", [("wallet", -250), ("merchant", 250)])

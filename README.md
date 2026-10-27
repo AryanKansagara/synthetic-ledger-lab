@@ -15,6 +15,30 @@ ledger.post("synthetic-transfer-001", [("demo-wallet", -250), ("merchant", 250)]
 assert ledger.balance("demo-wallet") == 750
 ```
 
+## Account balance floors
+
+Synthetic wallet-style accounts can opt into an atomic minimum-balance policy.
+The policy is checked inside the same serialized SQLite write transaction as the
+posting, preventing competing writers from both spending the same available
+balance. Accounts remain unrestricted by default so synthetic clearing accounts
+can model negative balances:
+
+```python
+ledger.set_minimum_balance("demo-wallet", 0)
+ledger.post("synthetic-purchase-001", [("demo-wallet", -750), ("merchant", 750)])
+
+# This raises ValueError without recording any part of the transaction.
+ledger.post("synthetic-overdraft-001", [("demo-wallet", -1), ("merchant", 1)])
+
+# Explicitly remove a policy when unrestricted behavior is intended.
+ledger.set_minimum_balance("demo-wallet", None)
+```
+
+A floor must be a signed 64-bit integer no greater than the account's current
+balance when configured. Policies persist in the ledger database. They are a
+narrow posting-time invariant, not authorization, credit underwriting, holds,
+or a substitute for a production risk engine.
+
 ## Reconciliation export
 
 `Ledger.export_reconciliation_csv(path)` writes an atomic, deterministic CSV
@@ -65,4 +89,7 @@ Run: `python3 -m unittest discover -s tests -v` (Python standard library only).
 
 Tests run locally and in GitHub Actions on Python 3.11 and 3.14.
 
-This is an educational ledger core, not a payment system. Negative balances are currently allowed (e.g. external clearing); account-level overdraft policies are future work. Each transaction uses distinct accounts and an ordered payload; reordering otherwise equivalent postings counts as a conflict.
+This is an educational ledger core, not a payment system. Negative balances are
+allowed for unrestricted accounts (for example, external clearing). Each
+transaction uses distinct accounts and an ordered payload; reordering otherwise
+equivalent postings counts as a conflict.

@@ -67,7 +67,63 @@ class Ledger:
                 amount INTEGER NOT NULL CHECK(amount != 0),
                 PRIMARY KEY (tx_id, account)
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS account_policies (
+                account TEXT PRIMARY KEY,
+                minimum_balance INTEGER NOT NULL
+            )""")
             db.execute("CREATE INDEX IF NOT EXISTS postings_account ON postings(account)")
+
+    @staticmethod
+    def _validate_account(account: str) -> None:
+        if not isinstance(account, str) or not account.strip():
+            raise ValueError("account must be a non-empty string")
+
+    @staticmethod
+    def _balance_in_connection(db: sqlite3.Connection, account: str) -> int:
+        amounts = db.execute(
+            "SELECT amount FROM postings WHERE account = ?",
+            (account,),
+        )
+        return sum(amount for (amount,) in amounts)
+
+    def set_minimum_balance(self, account: str, minimum_balance: int | None) -> None:
+        """Atomically set or remove an account's posting-time balance floor.
+
+        A new floor cannot exceed the account's current balance. Passing ``None``
+        removes the policy. Policy checks and postings share SQLite's write lock,
+        so competing writers cannot both spend the same available balance.
+        """
+        self._validate_account(account)
+        if minimum_balance is not None and (
+            type(minimum_balance) is not int
+            or not -(2**63) <= minimum_balance < 2**63
+        ):
+            raise ValueError("minimum_balance must be a signed 64-bit integer or None")
+
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if minimum_balance is None:
+                db.execute("DELETE FROM account_policies WHERE account = ?", (account,))
+                return
+            if self._balance_in_connection(db, account) < minimum_balance:
+                raise ValueError("minimum balance cannot exceed current balance")
+            db.execute(
+                """INSERT INTO account_policies (account, minimum_balance)
+                   VALUES (?, ?)
+                   ON CONFLICT(account) DO UPDATE
+                   SET minimum_balance = excluded.minimum_balance""",
+                (account, minimum_balance),
+            )
+
+    def minimum_balance(self, account: str) -> int | None:
+        """Return an account's configured balance floor, or ``None`` if unrestricted."""
+        self._validate_account(account)
+        with sqlite3.connect(self.path) as db:
+            row = db.execute(
+                "SELECT minimum_balance FROM account_policies WHERE account = ?",
+                (account,),
+            ).fetchone()
+        return None if row is None else row[0]
 
     def post(self, tx_id: str, entries: list[tuple[str, int]]) -> bool:
         """Post a zero-sum batch in integer minor units; False on exact replay."""
@@ -80,8 +136,7 @@ class Ledger:
             if not isinstance(entry, (list, tuple)) or len(entry) != 2:
                 raise ValueError("each posting requires account and amount")
             account, amount = entry
-            if not isinstance(account, str) or not account.strip():
-                raise ValueError("account must be a non-empty string")
+            self._validate_account(account)
             if type(amount) is not int or not -(2**63) <= amount < 2**63:
                 raise ValueError("amount must be a non-zero signed 64-bit integer")
             if amount == 0:
@@ -103,6 +158,17 @@ class Ledger:
                 if prior[0] != payload:
                     raise ValueError("transaction ID conflict")
                 return False
+            for account, amount in normalized:
+                policy = db.execute(
+                    "SELECT minimum_balance FROM account_policies WHERE account = ?",
+                    (account,),
+                ).fetchone()
+                if policy is not None:
+                    resulting_balance = self._balance_in_connection(db, account) + amount
+                    if resulting_balance < policy[0]:
+                        raise ValueError(
+                            f"minimum balance policy violated for account {account!r}"
+                        )
             db.execute(
                 "INSERT INTO transactions (tx_id, payload) VALUES (?, ?)",
                 (tx_id, payload),
@@ -121,11 +187,7 @@ class Ledger:
         readable after crossing that boundary.
         """
         with sqlite3.connect(self.path) as db:
-            amounts = db.execute(
-                "SELECT amount FROM postings WHERE account = ?",
-                (account,),
-            )
-            return sum(amount for (amount,) in amounts)
+            return self._balance_in_connection(db, account)
 
     def export_reconciliation_csv(
         self,
