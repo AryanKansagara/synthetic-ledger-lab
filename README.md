@@ -39,6 +39,32 @@ balance when configured. Policies persist in the ledger database. They are a
 narrow posting-time invariant, not authorization, credit underwriting, holds,
 or a substitute for a production risk engine.
 
+## Transaction audit queries
+
+Operational consumers can retrieve one immutable transaction or traverse the
+ledger with bounded keyset pagination. Pages are ordered by transaction ID;
+postings are ordered by account for deterministic output. An account filter
+selects transactions containing that account while still returning every
+posting in each matched transaction:
+
+```python
+page = ledger.transactions(limit=50, account="demo-wallet")
+for transaction in page.transactions:
+    print(transaction.transaction_id, transaction.postings)
+
+if page.next_cursor is not None:
+    next_page = ledger.transactions(
+        limit=50, account="demo-wallet", after=page.next_cursor
+    )
+
+single = ledger.transaction("synthetic-transfer-001")
+```
+
+Limits are restricted to 1–100 transactions. Cursors are transaction IDs, not
+offsets, so concurrent inserts before a cursor do not shift later pages. A
+multi-page traversal is not a frozen snapshot: transactions committed between
+requests can appear on a later page when their ID sorts after the cursor.
+
 ## Reconciliation export
 
 `Ledger.export_reconciliation_csv(path)` writes an atomic, deterministic CSV
