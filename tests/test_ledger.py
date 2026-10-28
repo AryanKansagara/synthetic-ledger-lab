@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from synthetic_ledger_lab.ledger import Ledger
+from synthetic_ledger_lab.ledger import AccountHold, Ledger
 
 
 class LedgerTests(unittest.TestCase):
@@ -137,6 +137,77 @@ class LedgerTests(unittest.TestCase):
                     self.ledger.set_minimum_balance("wallet", invalid)
         with self.assertRaises(ValueError):
             self.ledger.set_minimum_balance("", 0)
+
+    def test_hold_reserves_available_balance_until_idempotent_release(self):
+        self.ledger.post("fund", [("clearing", -1000), ("wallet", 1000)])
+        self.ledger.set_minimum_balance("wallet", 0)
+
+        self.assertTrue(self.ledger.place_hold("hold-1", "wallet", 700))
+        self.assertFalse(self.ledger.place_hold("hold-1", "wallet", 700))
+        self.assertEqual(self.ledger.balance("wallet"), 1000)
+        self.assertEqual(self.ledger.available_balance("wallet"), 300)
+        self.assertEqual(
+            self.ledger.hold("hold-1"),
+            AccountHold("hold-1", "wallet", 700, True),
+        )
+
+        with self.assertRaisesRegex(ValueError, "minimum balance policy violated"):
+            self.ledger.post("spend", [("wallet", -301), ("merchant", 301)])
+        with self.assertRaisesRegex(ValueError, "active holds"):
+            self.ledger.set_minimum_balance("wallet", None)
+        self.assertTrue(self.ledger.release_hold("hold-1"))
+        self.assertFalse(self.ledger.release_hold("hold-1"))
+        self.assertEqual(self.ledger.available_balance("wallet"), 1000)
+        released = self.ledger.hold("hold-1")
+        self.assertIsNotNone(released)
+        assert released is not None
+        self.assertFalse(released.active)
+        self.assertTrue(
+            self.ledger.post("spend", [("wallet", -301), ("merchant", 301)])
+        )
+
+    def test_hold_validates_policy_funds_and_id_conflicts_without_mutation(self):
+        self.ledger.post("fund", [("clearing", -500), ("wallet", 500)])
+        with self.assertRaisesRegex(ValueError, "requires a minimum balance policy"):
+            self.ledger.place_hold("hold-1", "wallet", 100)
+        self.ledger.set_minimum_balance("wallet", 100)
+        self.ledger.place_hold("hold-1", "wallet", 400)
+
+        with self.assertRaisesRegex(ValueError, "insufficient available balance"):
+            self.ledger.place_hold("hold-2", "wallet", 1)
+        with self.assertRaisesRegex(ValueError, "hold ID conflict"):
+            self.ledger.place_hold("hold-1", "wallet", 399)
+        with self.assertRaisesRegex(ValueError, "cannot exceed current balance"):
+            self.ledger.set_minimum_balance("wallet", 101)
+        with self.assertRaisesRegex(ValueError, "unknown hold ID"):
+            self.ledger.release_hold("missing")
+
+        invalid_amounts: tuple[Any, ...] = (True, 0, -1, 1.5, 2**63)
+        for invalid in invalid_amounts:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.ledger.place_hold("invalid", "wallet", invalid)
+        self.assertEqual(self.ledger.available_balance("wallet"), 100)
+
+    def test_competing_holds_cannot_reserve_the_same_available_balance(self):
+        self.ledger.post("fund", [("clearing", -1000), ("wallet", 1000)])
+        self.ledger.set_minimum_balance("wallet", 0)
+
+        def reserve(sequence: int) -> str:
+            try:
+                Ledger(self.path).place_hold(f"hold-{sequence}", "wallet", 750)
+                return "held"
+            except ValueError as error:
+                return str(error)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(reserve, (1, 2)))
+
+        self.assertEqual(outcomes.count("held"), 1)
+        self.assertEqual(
+            sum("insufficient available balance" in outcome for outcome in outcomes), 1
+        )
+        self.assertEqual(self.ledger.available_balance("wallet"), 250)
 
     def test_transaction_audit_lookup_returns_complete_deterministic_record(self):
         self.ledger.post("tx-1", [("wallet", -125), ("merchant", 100), ("fee", 25)])
