@@ -44,6 +44,30 @@ class ReconciliationReport:
     differences: tuple[ReconciliationDifference, ...]
 
 
+@dataclass(frozen=True)
+class Posting:
+    """One immutable posting returned by the audit query API."""
+
+    account: str
+    amount: int
+
+
+@dataclass(frozen=True)
+class LedgerTransaction:
+    """One persisted transaction and its deterministically ordered postings."""
+
+    transaction_id: str
+    postings: tuple[Posting, ...]
+
+
+@dataclass(frozen=True)
+class TransactionPage:
+    """A keyset-paginated page of immutable ledger transactions."""
+
+    transactions: tuple[LedgerTransaction, ...]
+    next_cursor: str | None
+
+
 _RECONCILIATION_HEADER = ("transaction_id", "account", "amount_minor")
 _CANONICAL_INTEGER = re.compile(r"-?[1-9][0-9]*\Z")
 _MAX_RECONCILIATION_BYTES = 10 * 1024 * 1024
@@ -188,6 +212,93 @@ class Ledger:
         """
         with sqlite3.connect(self.path) as db:
             return self._balance_in_connection(db, account)
+
+    def transaction(self, transaction_id: str) -> LedgerTransaction | None:
+        """Return one transaction for audit, or ``None`` when it does not exist."""
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise ValueError("transaction_id must be a non-empty string")
+        with sqlite3.connect(self.path) as db:
+            exists = db.execute(
+                "SELECT 1 FROM transactions WHERE tx_id = ?", (transaction_id,)
+            ).fetchone()
+            if exists is None:
+                return None
+            rows = db.execute(
+                """SELECT account, amount FROM postings
+                   WHERE tx_id = ? ORDER BY account""",
+                (transaction_id,),
+            ).fetchall()
+        return LedgerTransaction(
+            transaction_id=transaction_id,
+            postings=tuple(Posting(account, amount) for account, amount in rows),
+        )
+
+    def transactions(
+        self,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+        account: str | None = None,
+    ) -> TransactionPage:
+        """Return a deterministic keyset page for operational audit workflows.
+
+        Transactions are ordered by their ID and postings by account. ``after``
+        is the last transaction ID from a prior page. Supplying ``account``
+        returns complete transactions that contain a posting for that account,
+        rather than returning partial posting sets.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        if after is not None and (not isinstance(after, str) or not after.strip()):
+            raise ValueError("after must be a non-empty string or None")
+        if account is not None:
+            self._validate_account(account)
+
+        clauses: list[str] = []
+        parameters: list[str | int] = []
+        if after is not None:
+            clauses.append("t.tx_id > ?")
+            parameters.append(after)
+        if account is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM postings f "
+                "WHERE f.tx_id = t.tx_id AND f.account = ?)"
+            )
+            parameters.append(account)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with sqlite3.connect(self.path) as db:
+            transaction_ids = [
+                row[0]
+                for row in db.execute(
+                    f"""SELECT t.tx_id FROM transactions t {where}
+                        ORDER BY t.tx_id LIMIT ?""",
+                    (*parameters, limit + 1),
+                )
+            ]
+            page_ids = transaction_ids[:limit]
+            postings_by_transaction: dict[str, list[Posting]] = {
+                transaction_id: [] for transaction_id in page_ids
+            }
+            if page_ids:
+                placeholders = ",".join("?" for _ in page_ids)
+                for transaction_id, posting_account, amount in db.execute(
+                    f"""SELECT tx_id, account, amount FROM postings
+                        WHERE tx_id IN ({placeholders}) ORDER BY tx_id, account""",
+                    page_ids,
+                ):
+                    postings_by_transaction[transaction_id].append(
+                        Posting(posting_account, amount)
+                    )
+
+        transactions = tuple(
+            LedgerTransaction(transaction_id, tuple(postings_by_transaction[transaction_id]))
+            for transaction_id in page_ids
+        )
+        return TransactionPage(
+            transactions=transactions,
+            next_cursor=page_ids[-1] if len(transaction_ids) > limit else None,
+        )
 
     def export_reconciliation_csv(
         self,

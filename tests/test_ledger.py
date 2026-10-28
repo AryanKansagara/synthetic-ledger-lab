@@ -138,6 +138,73 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.ledger.set_minimum_balance("", 0)
 
+    def test_transaction_audit_lookup_returns_complete_deterministic_record(self):
+        self.ledger.post("tx-1", [("wallet", -125), ("merchant", 100), ("fee", 25)])
+
+        transaction = self.ledger.transaction("tx-1")
+
+        self.assertIsNotNone(transaction)
+        assert transaction is not None
+        self.assertEqual(transaction.transaction_id, "tx-1")
+        self.assertEqual(
+            [(posting.account, posting.amount) for posting in transaction.postings],
+            [("fee", 25), ("merchant", 100), ("wallet", -125)],
+        )
+        self.assertIsNone(self.ledger.transaction("missing"))
+
+    def test_transaction_pages_use_stable_keyset_and_return_complete_transactions(self):
+        for transaction_id, account in (
+            ("tx-c", "shop-2"),
+            ("tx-a", "shop-1"),
+            ("tx-b", "shop-1"),
+        ):
+            self.ledger.post(transaction_id, [("wallet", -10), (account, 10)])
+
+        first = self.ledger.transactions(limit=2)
+        second = self.ledger.transactions(limit=2, after=first.next_cursor)
+
+        self.assertEqual(
+            [transaction.transaction_id for transaction in first.transactions],
+            ["tx-a", "tx-b"],
+        )
+        self.assertEqual(first.next_cursor, "tx-b")
+        self.assertEqual(
+            [transaction.transaction_id for transaction in second.transactions], ["tx-c"]
+        )
+        self.assertIsNone(second.next_cursor)
+        self.assertEqual(len(second.transactions[0].postings), 2)
+
+        filtered = self.ledger.transactions(account="shop-1")
+        self.assertEqual(
+            [transaction.transaction_id for transaction in filtered.transactions],
+            ["tx-a", "tx-b"],
+        )
+        self.assertTrue(
+            all(len(transaction.postings) == 2 for transaction in filtered.transactions)
+        )
+
+    def test_transaction_queries_validate_bounds_and_do_not_mutate(self):
+        self.ledger.post("tx-1", [("wallet", -10), ("merchant", 10)])
+
+        invalid_limits: tuple[Any, ...] = (True, 0, 101, 1.5)
+        for invalid in invalid_limits:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.ledger.transactions(limit=invalid)
+        with self.assertRaises(ValueError):
+            self.ledger.transactions(after="")
+        with self.assertRaises(ValueError):
+            self.ledger.transactions(after=1)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            self.ledger.transactions(account="")
+        with self.assertRaises(ValueError):
+            self.ledger.transaction("")
+
+        self.assertEqual(self.ledger.balance("wallet"), -10)
+        self.assertFalse(
+            self.ledger.post("tx-1", [("wallet", -10), ("merchant", 10)])
+        )
+
     def test_reconciliation_export_is_deterministic_and_checksummed(self):
         self.ledger.post("tx-z", [("wallet", -250), ("merchant", 250)])
         self.ledger.post("tx-a", [("clearing", -1000), ("wallet", 1000)])
