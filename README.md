@@ -35,9 +35,31 @@ ledger.set_minimum_balance("demo-wallet", None)
 ```
 
 A floor must be a signed 64-bit integer no greater than the account's current
-balance when configured. Policies persist in the ledger database. They are a
-narrow posting-time invariant, not authorization, credit underwriting, holds,
-or a substitute for a production risk engine.
+available balance when configured. Policies persist in the ledger database.
+They are a narrow posting-time invariant, not authorization, credit
+underwriting, or a substitute for a production risk engine.
+
+## Account holds
+
+Accounts with a minimum-balance policy can reserve funds under a durable,
+idempotent hold ID. Active holds reduce `available_balance` without changing the
+posted ledger balance, and posting checks run under the same SQLite write lock:
+
+```python
+ledger.place_hold("synthetic-order-hold-001", "demo-wallet", 250)
+assert ledger.balance("demo-wallet") == 750
+assert ledger.available_balance("demo-wallet") == 500
+
+ledger.release_hold("synthetic-order-hold-001")
+assert ledger.available_balance("demo-wallet") == 750
+```
+
+Exact hold-ID replays have no effect; conflicting reuse is rejected. Released
+holds remain queryable with `ledger.hold(id)` for audit and cannot be reactivated.
+A minimum-balance policy cannot be removed while its account has active holds.
+This slice models reservation and release only. Atomic capture, expiration,
+authorization, external payment-rail semantics, and distributed locking remain
+explicitly out of scope.
 
 ## Transaction audit queries
 

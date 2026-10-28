@@ -68,6 +68,16 @@ class TransactionPage:
     next_cursor: str | None
 
 
+@dataclass(frozen=True)
+class AccountHold:
+    """One durable synthetic balance reservation."""
+
+    hold_id: str
+    account: str
+    amount: int
+    active: bool
+
+
 _RECONCILIATION_HEADER = ("transaction_id", "account", "amount_minor")
 _CANONICAL_INTEGER = re.compile(r"-?[1-9][0-9]*\Z")
 _MAX_RECONCILIATION_BYTES = 10 * 1024 * 1024
@@ -95,7 +105,17 @@ class Ledger:
                 account TEXT PRIMARY KEY,
                 minimum_balance INTEGER NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS account_holds (
+                hold_id TEXT PRIMARY KEY,
+                account TEXT NOT NULL,
+                amount INTEGER NOT NULL CHECK(amount > 0),
+                active INTEGER NOT NULL CHECK(active IN (0, 1))
+            )""")
             db.execute("CREATE INDEX IF NOT EXISTS postings_account ON postings(account)")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS active_holds_account "
+                "ON account_holds(account, active)"
+            )
 
     @staticmethod
     def _validate_account(account: str) -> None:
@@ -106,6 +126,14 @@ class Ledger:
     def _balance_in_connection(db: sqlite3.Connection, account: str) -> int:
         amounts = db.execute(
             "SELECT amount FROM postings WHERE account = ?",
+            (account,),
+        )
+        return sum(amount for (amount,) in amounts)
+
+    @staticmethod
+    def _active_holds_in_connection(db: sqlite3.Connection, account: str) -> int:
+        amounts = db.execute(
+            "SELECT amount FROM account_holds WHERE account = ? AND active = 1",
             (account,),
         )
         return sum(amount for (amount,) in amounts)
@@ -127,9 +155,14 @@ class Ledger:
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             if minimum_balance is None:
+                if self._active_holds_in_connection(db, account):
+                    raise ValueError("cannot remove policy while account has active holds")
                 db.execute("DELETE FROM account_policies WHERE account = ?", (account,))
                 return
-            if self._balance_in_connection(db, account) < minimum_balance:
+            available = self._balance_in_connection(
+                db, account
+            ) - self._active_holds_in_connection(db, account)
+            if available < minimum_balance:
                 raise ValueError("minimum balance cannot exceed current balance")
             db.execute(
                 """INSERT INTO account_policies (account, minimum_balance)
@@ -148,6 +181,87 @@ class Ledger:
                 (account,),
             ).fetchone()
         return None if row is None else row[0]
+
+    def place_hold(self, hold_id: str, account: str, amount: int) -> bool:
+        """Reserve available balance under an account's configured floor.
+
+        Returns ``False`` for an exact hold-ID replay. A hold is durable until
+        released and prevents unrelated postings from spending its reserved
+        amount. Holds require an existing minimum-balance policy so their lower
+        bound is explicit rather than silently assuming zero.
+        """
+        if not isinstance(hold_id, str) or not hold_id.strip():
+            raise ValueError("hold_id must be a non-empty string")
+        self._validate_account(account)
+        if type(amount) is not int or not 0 < amount < 2**63:
+            raise ValueError("amount must be a positive signed 64-bit integer")
+
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT account, amount FROM account_holds WHERE hold_id = ?",
+                (hold_id,),
+            ).fetchone()
+            if prior is not None:
+                if prior != (account, amount):
+                    raise ValueError("hold ID conflict")
+                return False
+            policy = db.execute(
+                "SELECT minimum_balance FROM account_policies WHERE account = ?",
+                (account,),
+            ).fetchone()
+            if policy is None:
+                raise ValueError("account hold requires a minimum balance policy")
+            available = self._balance_in_connection(
+                db, account
+            ) - self._active_holds_in_connection(db, account)
+            if available - amount < policy[0]:
+                raise ValueError("insufficient available balance for hold")
+            db.execute(
+                """INSERT INTO account_holds (hold_id, account, amount, active)
+                   VALUES (?, ?, ?, 1)""",
+                (hold_id, account, amount),
+            )
+            return True
+
+    def release_hold(self, hold_id: str) -> bool:
+        """Release a hold once; return ``False`` when it was already released."""
+        if not isinstance(hold_id, str) or not hold_id.strip():
+            raise ValueError("hold_id must be a non-empty string")
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT active FROM account_holds WHERE hold_id = ?", (hold_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown hold ID")
+            if not row[0]:
+                return False
+            db.execute(
+                "UPDATE account_holds SET active = 0 WHERE hold_id = ?", (hold_id,)
+            )
+            return True
+
+    def hold(self, hold_id: str) -> AccountHold | None:
+        """Return a hold for operational audit, including released holds."""
+        if not isinstance(hold_id, str) or not hold_id.strip():
+            raise ValueError("hold_id must be a non-empty string")
+        with sqlite3.connect(self.path) as db:
+            row = db.execute(
+                """SELECT hold_id, account, amount, active
+                   FROM account_holds WHERE hold_id = ?""",
+                (hold_id,),
+            ).fetchone()
+        return None if row is None else AccountHold(row[0], row[1], row[2], bool(row[3]))
+
+    def available_balance(self, account: str) -> int:
+        """Return current balance less all active holds for an account."""
+        self._validate_account(account)
+        with sqlite3.connect(self.path) as db:
+            db.execute("BEGIN")
+            return self._balance_in_connection(
+                db, account
+            ) - self._active_holds_in_connection(db, account)
 
     def post(self, tx_id: str, entries: list[tuple[str, int]]) -> bool:
         """Post a zero-sum batch in integer minor units; False on exact replay."""
@@ -188,8 +302,12 @@ class Ledger:
                     (account,),
                 ).fetchone()
                 if policy is not None:
-                    resulting_balance = self._balance_in_connection(db, account) + amount
-                    if resulting_balance < policy[0]:
+                    resulting_available = (
+                        self._balance_in_connection(db, account)
+                        + amount
+                        - self._active_holds_in_connection(db, account)
+                    )
+                    if resulting_available < policy[0]:
                         raise ValueError(
                             f"minimum balance policy violated for account {account!r}"
                         )
