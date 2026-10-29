@@ -72,9 +72,27 @@ ledger.capture_hold(
 
 Exact capture replays have no effect; conflicting transaction IDs, destinations,
 or attempts to capture released holds are rejected. Capture always transfers the
-entire hold to one destination account. Partial capture, expiration,
-authorization, external payment-rail semantics, and distributed locking remain
-explicitly out of scope.
+entire hold to one destination account.
+
+Holds can also carry an integer Unix-time expiration deadline. Due holds are
+durably marked expired before balance-sensitive operations, release, capture, or
+audit lookup, and their reserved balance becomes available atomically. A worker
+can proactively sweep due holds with `expire_holds()`; retries return zero after
+the first successful transition:
+
+```python
+ledger.place_hold(
+    "synthetic-order-hold-003", "demo-wallet", 100, expires_at=1_800_000_000
+)
+expired_count = ledger.expire_holds()
+```
+
+`Ledger(..., clock=...)` accepts an injected integer-seconds clock for
+deterministic tests. The persisted audit record retains both `expires_at` and
+`expired_at`; an expired hold cannot be captured, released, or reactivated.
+Expiration is process-driven rather than an external scheduler guarantee.
+Partial capture, authorization, external payment-rail semantics, and distributed
+locking remain explicitly out of scope.
 
 ## Transaction audit queries
 

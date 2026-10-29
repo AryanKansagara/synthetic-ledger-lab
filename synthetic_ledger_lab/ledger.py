@@ -9,6 +9,8 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +79,8 @@ class AccountHold:
     amount: int
     active: bool
     captured_transaction_id: str | None = None
+    expires_at: int | None = None
+    expired_at: int | None = None
 
 
 _RECONCILIATION_HEADER = ("transaction_id", "account", "amount_minor")
@@ -90,8 +94,11 @@ def _validate_signing_key(signing_key: bytes) -> None:
 
 
 class Ledger:
-    def __init__(self, path: str | Path):
+    def __init__(
+        self, path: str | Path, *, clock: Callable[[], int] | None = None
+    ):
         self.path = Path(path)
+        self._clock = clock or (lambda: int(time.time()))
         with sqlite3.connect(self.path) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS transactions (
                 tx_id TEXT PRIMARY KEY, payload TEXT NOT NULL
@@ -111,7 +118,9 @@ class Ledger:
                 account TEXT NOT NULL,
                 amount INTEGER NOT NULL CHECK(amount > 0),
                 active INTEGER NOT NULL CHECK(active IN (0, 1)),
-                captured_tx_id TEXT REFERENCES transactions(tx_id)
+                captured_tx_id TEXT REFERENCES transactions(tx_id),
+                expires_at INTEGER,
+                expired_at INTEGER
             )""")
             hold_columns = {
                 row[1] for row in db.execute("PRAGMA table_info(account_holds)")
@@ -121,6 +130,10 @@ class Ledger:
                     "ALTER TABLE account_holds ADD COLUMN captured_tx_id TEXT "
                     "REFERENCES transactions(tx_id)"
                 )
+            if "expires_at" not in hold_columns:
+                db.execute("ALTER TABLE account_holds ADD COLUMN expires_at INTEGER")
+            if "expired_at" not in hold_columns:
+                db.execute("ALTER TABLE account_holds ADD COLUMN expired_at INTEGER")
             db.execute("CREATE INDEX IF NOT EXISTS postings_account ON postings(account)")
             db.execute(
                 "CREATE INDEX IF NOT EXISTS active_holds_account "
@@ -148,6 +161,38 @@ class Ledger:
         )
         return sum(amount for (amount,) in amounts)
 
+    def _now(self) -> int:
+        now = self._clock()
+        if type(now) is not int or not 0 <= now < 2**63:
+            raise ValueError("clock must return a non-negative signed 64-bit integer")
+        return now
+
+    @staticmethod
+    def _expire_holds_in_connection(
+        db: sqlite3.Connection, now: int, account: str | None = None
+    ) -> int:
+        account_clause = " AND account = ?" if account is not None else ""
+        parameters = (now, account) if account is not None else (now,)
+        cursor = db.execute(
+            """UPDATE account_holds
+               SET active = 0, expired_at = expires_at
+               WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?"""
+            + account_clause,
+            parameters,
+        )
+        return cursor.rowcount
+
+    def expire_holds(self) -> int:
+        """Durably expire all holds whose deadline has passed.
+
+        Returns the number transitioned by this call. Expiration uses the
+        injected integer Unix-time clock and is idempotent across retries.
+        """
+        now = self._now()
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._expire_holds_in_connection(db, now)
+
     def set_minimum_balance(self, account: str, minimum_balance: int | None) -> None:
         """Atomically set or remove an account's posting-time balance floor.
 
@@ -164,6 +209,7 @@ class Ledger:
 
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now(), account)
             if minimum_balance is None:
                 if self._active_holds_in_connection(db, account):
                     raise ValueError("cannot remove policy while account has active holds")
@@ -192,30 +238,48 @@ class Ledger:
             ).fetchone()
         return None if row is None else row[0]
 
-    def place_hold(self, hold_id: str, account: str, amount: int) -> bool:
+    def place_hold(
+        self,
+        hold_id: str,
+        account: str,
+        amount: int,
+        *,
+        expires_at: int | None = None,
+    ) -> bool:
         """Reserve available balance under an account's configured floor.
 
         Returns ``False`` for an exact hold-ID replay. A hold is durable until
-        released and prevents unrelated postings from spending its reserved
-        amount. Holds require an existing minimum-balance policy so their lower
-        bound is explicit rather than silently assuming zero.
+        released, captured, or expired and prevents unrelated postings from
+        spending its reserved amount. Holds require an existing minimum-balance
+        policy so their lower bound is explicit rather than silently assuming
+        zero.
         """
         if not isinstance(hold_id, str) or not hold_id.strip():
             raise ValueError("hold_id must be a non-empty string")
         self._validate_account(account)
         if type(amount) is not int or not 0 < amount < 2**63:
             raise ValueError("amount must be a positive signed 64-bit integer")
+        if expires_at is not None and (
+            type(expires_at) is not int or not 0 <= expires_at < 2**63
+        ):
+            raise ValueError(
+                "expires_at must be a non-negative signed 64-bit integer or None"
+            )
 
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
+            now = self._now()
+            self._expire_holds_in_connection(db, now, account)
             prior = db.execute(
-                "SELECT account, amount FROM account_holds WHERE hold_id = ?",
+                "SELECT account, amount, expires_at FROM account_holds WHERE hold_id = ?",
                 (hold_id,),
             ).fetchone()
             if prior is not None:
-                if prior != (account, amount):
+                if prior != (account, amount, expires_at):
                     raise ValueError("hold ID conflict")
                 return False
+            if expires_at is not None and expires_at <= now:
+                raise ValueError("expires_at must be in the future")
             policy = db.execute(
                 "SELECT minimum_balance FROM account_policies WHERE account = ?",
                 (account,),
@@ -228,9 +292,10 @@ class Ledger:
             if available - amount < policy[0]:
                 raise ValueError("insufficient available balance for hold")
             db.execute(
-                """INSERT INTO account_holds (hold_id, account, amount, active)
-                   VALUES (?, ?, ?, 1)""",
-                (hold_id, account, amount),
+                """INSERT INTO account_holds
+                   (hold_id, account, amount, active, expires_at)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (hold_id, account, amount, expires_at),
             )
             return True
 
@@ -240,14 +305,18 @@ class Ledger:
             raise ValueError("hold_id must be a non-empty string")
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now())
             row = db.execute(
-                "SELECT active, captured_tx_id FROM account_holds WHERE hold_id = ?",
+                """SELECT active, captured_tx_id, expired_at
+                   FROM account_holds WHERE hold_id = ?""",
                 (hold_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("unknown hold ID")
             if row[1] is not None:
                 raise ValueError("captured hold cannot be released")
+            if row[2] is not None:
+                raise ValueError("expired hold cannot be released")
             if not row[0]:
                 return False
             db.execute(
@@ -274,14 +343,15 @@ class Ledger:
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now())
             hold = db.execute(
-                """SELECT account, amount, active, captured_tx_id
+                """SELECT account, amount, active, captured_tx_id, expired_at
                    FROM account_holds WHERE hold_id = ?""",
                 (hold_id,),
             ).fetchone()
             if hold is None:
                 raise ValueError("unknown hold ID")
-            account, amount, active, captured_transaction_id = hold
+            account, amount, active, captured_transaction_id, expired_at = hold
             if destination_account == account:
                 raise ValueError("capture destination must differ from held account")
             entries = [(account, -amount), (destination_account, amount)]
@@ -295,6 +365,8 @@ class Ledger:
                 if captured_transaction_id == transaction_id and prior == (payload,):
                     return False
                 raise ValueError("hold capture conflict")
+            if expired_at is not None:
+                raise ValueError("expired hold cannot be captured")
             if not active:
                 raise ValueError("released hold cannot be captured")
             if db.execute(
@@ -340,23 +412,29 @@ class Ledger:
         """Return a hold for operational audit, including inactive holds."""
         if not isinstance(hold_id, str) or not hold_id.strip():
             raise ValueError("hold_id must be a non-empty string")
-        with sqlite3.connect(self.path) as db:
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now())
             row = db.execute(
-                """SELECT hold_id, account, amount, active, captured_tx_id
+                """SELECT hold_id, account, amount, active, captured_tx_id,
+                          expires_at, expired_at
                    FROM account_holds WHERE hold_id = ?""",
                 (hold_id,),
             ).fetchone()
         return (
             None
             if row is None
-            else AccountHold(row[0], row[1], row[2], bool(row[3]), row[4])
+            else AccountHold(
+                row[0], row[1], row[2], bool(row[3]), row[4], row[5], row[6]
+            )
         )
 
     def available_balance(self, account: str) -> int:
         """Return current balance less all active holds for an account."""
         self._validate_account(account)
-        with sqlite3.connect(self.path) as db:
-            db.execute("BEGIN")
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now(), account)
             return self._balance_in_connection(
                 db, account
             ) - self._active_holds_in_connection(db, account)
@@ -387,6 +465,9 @@ class Ledger:
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("BEGIN IMMEDIATE")
+            now = self._now()
+            for account, _ in normalized:
+                self._expire_holds_in_connection(db, now, account)
             prior = db.execute(
                 "SELECT payload FROM transactions WHERE tx_id = ?", (tx_id,)
             ).fetchone()
