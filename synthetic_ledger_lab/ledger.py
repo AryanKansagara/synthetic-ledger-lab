@@ -76,6 +76,7 @@ class AccountHold:
     account: str
     amount: int
     active: bool
+    captured_transaction_id: str | None = None
 
 
 _RECONCILIATION_HEADER = ("transaction_id", "account", "amount_minor")
@@ -109,8 +110,17 @@ class Ledger:
                 hold_id TEXT PRIMARY KEY,
                 account TEXT NOT NULL,
                 amount INTEGER NOT NULL CHECK(amount > 0),
-                active INTEGER NOT NULL CHECK(active IN (0, 1))
+                active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                captured_tx_id TEXT REFERENCES transactions(tx_id)
             )""")
+            hold_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(account_holds)")
+            }
+            if "captured_tx_id" not in hold_columns:
+                db.execute(
+                    "ALTER TABLE account_holds ADD COLUMN captured_tx_id TEXT "
+                    "REFERENCES transactions(tx_id)"
+                )
             db.execute("CREATE INDEX IF NOT EXISTS postings_account ON postings(account)")
             db.execute(
                 "CREATE INDEX IF NOT EXISTS active_holds_account "
@@ -231,10 +241,13 @@ class Ledger:
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT active FROM account_holds WHERE hold_id = ?", (hold_id,)
+                "SELECT active, captured_tx_id FROM account_holds WHERE hold_id = ?",
+                (hold_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("unknown hold ID")
+            if row[1] is not None:
+                raise ValueError("captured hold cannot be released")
             if not row[0]:
                 return False
             db.execute(
@@ -242,17 +255,102 @@ class Ledger:
             )
             return True
 
+    def capture_hold(
+        self, hold_id: str, transaction_id: str, destination_account: str
+    ) -> bool:
+        """Atomically convert an active hold into a two-posting transaction.
+
+        The full reserved amount is debited from the held account and credited to
+        ``destination_account``. Returns ``False`` for an exact capture replay.
+        Capture, policy checks, hold state, and postings share one SQLite write
+        transaction, so funds cannot become available between those operations.
+        """
+        if not isinstance(hold_id, str) or not hold_id.strip():
+            raise ValueError("hold_id must be a non-empty string")
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise ValueError("transaction_id must be a non-empty string")
+        self._validate_account(destination_account)
+
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            hold = db.execute(
+                """SELECT account, amount, active, captured_tx_id
+                   FROM account_holds WHERE hold_id = ?""",
+                (hold_id,),
+            ).fetchone()
+            if hold is None:
+                raise ValueError("unknown hold ID")
+            account, amount, active, captured_transaction_id = hold
+            if destination_account == account:
+                raise ValueError("capture destination must differ from held account")
+            entries = [(account, -amount), (destination_account, amount)]
+            payload = json.dumps(entries, separators=(",", ":"))
+
+            if captured_transaction_id is not None:
+                prior = db.execute(
+                    "SELECT payload FROM transactions WHERE tx_id = ?",
+                    (captured_transaction_id,),
+                ).fetchone()
+                if captured_transaction_id == transaction_id and prior == (payload,):
+                    return False
+                raise ValueError("hold capture conflict")
+            if not active:
+                raise ValueError("released hold cannot be captured")
+            if db.execute(
+                "SELECT 1 FROM transactions WHERE tx_id = ?", (transaction_id,)
+            ).fetchone() is not None:
+                raise ValueError("transaction ID conflict")
+
+            db.execute(
+                "INSERT INTO transactions (tx_id, payload) VALUES (?, ?)",
+                (transaction_id, payload),
+            )
+            db.execute(
+                """UPDATE account_holds
+                   SET active = 0, captured_tx_id = ? WHERE hold_id = ?""",
+                (transaction_id, hold_id),
+            )
+            for posting_account, posting_amount in entries:
+                policy = db.execute(
+                    "SELECT minimum_balance FROM account_policies WHERE account = ?",
+                    (posting_account,),
+                ).fetchone()
+                if policy is not None:
+                    resulting_available = (
+                        self._balance_in_connection(db, posting_account)
+                        + posting_amount
+                        - self._active_holds_in_connection(db, posting_account)
+                    )
+                    if resulting_available < policy[0]:
+                        raise ValueError(
+                            "minimum balance policy violated for account "
+                            f"{posting_account!r}"
+                        )
+            db.executemany(
+                "INSERT INTO postings (tx_id, account, amount) VALUES (?, ?, ?)",
+                [
+                    (transaction_id, posting_account, posting_amount)
+                    for posting_account, posting_amount in entries
+                ],
+            )
+            return True
+
     def hold(self, hold_id: str) -> AccountHold | None:
-        """Return a hold for operational audit, including released holds."""
+        """Return a hold for operational audit, including inactive holds."""
         if not isinstance(hold_id, str) or not hold_id.strip():
             raise ValueError("hold_id must be a non-empty string")
         with sqlite3.connect(self.path) as db:
             row = db.execute(
-                """SELECT hold_id, account, amount, active
+                """SELECT hold_id, account, amount, active, captured_tx_id
                    FROM account_holds WHERE hold_id = ?""",
                 (hold_id,),
             ).fetchone()
-        return None if row is None else AccountHold(row[0], row[1], row[2], bool(row[3]))
+        return (
+            None
+            if row is None
+            else AccountHold(row[0], row[1], row[2], bool(row[3]), row[4])
+        )
 
     def available_balance(self, account: str) -> int:
         """Return current balance less all active holds for an account."""

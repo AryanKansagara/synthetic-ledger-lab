@@ -57,7 +57,22 @@ assert ledger.available_balance("demo-wallet") == 750
 Exact hold-ID replays have no effect; conflicting reuse is rejected. Released
 holds remain queryable with `ledger.hold(id)` for audit and cannot be reactivated.
 A minimum-balance policy cannot be removed while its account has active holds.
-This slice models reservation and release only. Atomic capture, expiration,
+
+The full reserved amount can instead be atomically captured into an immutable
+two-posting transaction. Capture deactivates the hold and debits the held account
+in the same SQLite write transaction, so the reserved balance is never briefly
+available to a competing writer:
+
+```python
+ledger.place_hold("synthetic-order-hold-002", "demo-wallet", 250)
+ledger.capture_hold(
+    "synthetic-order-hold-002", "synthetic-purchase-002", "merchant"
+)
+```
+
+Exact capture replays have no effect; conflicting transaction IDs, destinations,
+or attempts to capture released holds are rejected. Capture always transfers the
+entire hold to one destination account. Partial capture, expiration,
 authorization, external payment-rail semantics, and distributed locking remain
 explicitly out of scope.
 
