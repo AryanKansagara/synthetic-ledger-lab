@@ -282,6 +282,76 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.available_balance("wallet"), 0)
         self.assertIsNone(self.ledger.transaction("capture"))
 
+    def test_hold_expiration_releases_balance_and_persists_audit_deadline(self):
+        now = [1_000]
+        ledger = Ledger(self.path, clock=lambda: now[0])
+        ledger.post("fund", [("clearing", -500), ("wallet", 500)])
+        ledger.set_minimum_balance("wallet", 0)
+        ledger.place_hold("timed", "wallet", 400, expires_at=1_100)
+
+        self.assertEqual(ledger.available_balance("wallet"), 100)
+        self.assertEqual(
+            ledger.hold("timed"),
+            AccountHold("timed", "wallet", 400, True, None, 1_100, None),
+        )
+
+        now[0] = 1_100
+        self.assertEqual(ledger.expire_holds(), 1)
+        self.assertEqual(ledger.available_balance("wallet"), 500)
+        self.assertEqual(ledger.expire_holds(), 0)
+        self.assertEqual(
+            Ledger(self.path, clock=lambda: now[0]).hold("timed"),
+            AccountHold("timed", "wallet", 400, False, None, 1_100, 1_100),
+        )
+
+    def test_expired_hold_cannot_be_captured_released_or_reactivated(self):
+        now = [10]
+        ledger = Ledger(self.path, clock=lambda: now[0])
+        ledger.post("fund", [("clearing", -100), ("wallet", 100)])
+        ledger.set_minimum_balance("wallet", 0)
+        ledger.place_hold("timed", "wallet", 100, expires_at=20)
+        now[0] = 21
+
+        with self.assertRaisesRegex(ValueError, "expired hold cannot be captured"):
+            ledger.capture_hold("timed", "capture", "merchant")
+        with self.assertRaisesRegex(ValueError, "expired hold cannot be released"):
+            ledger.release_hold("timed")
+        self.assertFalse(ledger.place_hold("timed", "wallet", 100, expires_at=20))
+        self.assertIsNone(ledger.transaction("capture"))
+        self.assertEqual(ledger.available_balance("wallet"), 100)
+
+    def test_expiration_is_applied_before_posting_and_policy_removal(self):
+        now = [100]
+        ledger = Ledger(self.path, clock=lambda: now[0])
+        ledger.post("fund", [("clearing", -100), ("wallet", 100)])
+        ledger.set_minimum_balance("wallet", 0)
+        ledger.place_hold("timed", "wallet", 100, expires_at=101)
+
+        now[0] = 101
+        self.assertTrue(ledger.post("spend", [("wallet", -100), ("merchant", 100)]))
+        ledger.set_minimum_balance("wallet", None)
+        self.assertIsNone(ledger.minimum_balance("wallet"))
+
+    def test_hold_expiration_validates_deadlines_clock_and_replay_identity(self):
+        now = [50]
+        ledger = Ledger(self.path, clock=lambda: now[0])
+        ledger.post("fund", [("clearing", -10), ("wallet", 10)])
+        ledger.set_minimum_balance("wallet", 0)
+
+        invalid_deadlines: tuple[Any, ...] = (True, -1, 1.5, 2**63)
+        for invalid in invalid_deadlines:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    ledger.place_hold("invalid", "wallet", 1, expires_at=invalid)
+        with self.assertRaisesRegex(ValueError, "future"):
+            ledger.place_hold("past", "wallet", 1, expires_at=50)
+
+        ledger.place_hold("timed", "wallet", 1, expires_at=60)
+        with self.assertRaisesRegex(ValueError, "hold ID conflict"):
+            ledger.place_hold("timed", "wallet", 1, expires_at=61)
+        with self.assertRaisesRegex(ValueError, "clock must return"):
+            Ledger(self.path, clock=lambda: True).expire_holds()
+
     def test_existing_hold_schema_is_migrated_for_capture(self):
         legacy_path = Path(self.tmp.name) / "legacy.sqlite3"
         with sqlite3.connect(legacy_path) as db:
@@ -302,6 +372,8 @@ class LedgerTests(unittest.TestCase):
         with sqlite3.connect(legacy_path) as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(account_holds)")}
         self.assertIn("captured_tx_id", columns)
+        self.assertIn("expires_at", columns)
+        self.assertIn("expired_at", columns)
         self.assertIsNone(migrated.hold("missing"))
 
     def test_transaction_audit_lookup_returns_complete_deterministic_record(self):
