@@ -2,6 +2,7 @@ import csv
 import concurrent.futures
 import hashlib
 import hmac
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -208,6 +209,100 @@ class LedgerTests(unittest.TestCase):
             sum("insufficient available balance" in outcome for outcome in outcomes), 1
         )
         self.assertEqual(self.ledger.available_balance("wallet"), 250)
+
+    def test_hold_capture_atomically_posts_and_is_idempotent(self):
+        self.ledger.post("fund", [("clearing", -1000), ("wallet", 1000)])
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.place_hold("hold-1", "wallet", 700)
+
+        self.assertTrue(self.ledger.capture_hold("hold-1", "capture-1", "merchant"))
+        self.assertFalse(self.ledger.capture_hold("hold-1", "capture-1", "merchant"))
+        self.assertEqual(self.ledger.balance("wallet"), 300)
+        self.assertEqual(self.ledger.available_balance("wallet"), 300)
+        self.assertEqual(self.ledger.balance("merchant"), 700)
+        self.assertEqual(
+            self.ledger.hold("hold-1"),
+            AccountHold("hold-1", "wallet", 700, False, "capture-1"),
+        )
+        transaction = self.ledger.transaction("capture-1")
+        self.assertIsNotNone(transaction)
+        assert transaction is not None
+        self.assertEqual(
+            [(posting.account, posting.amount) for posting in transaction.postings],
+            [("merchant", 700), ("wallet", -700)],
+        )
+        with self.assertRaisesRegex(ValueError, "captured hold cannot be released"):
+            self.ledger.release_hold("hold-1")
+
+    def test_hold_capture_rejects_conflicts_and_released_holds_without_mutation(self):
+        self.ledger.post("fund", [("clearing", -500), ("wallet", 500)])
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.place_hold("captured", "wallet", 200)
+        self.ledger.capture_hold("captured", "capture-1", "merchant")
+
+        with self.assertRaisesRegex(ValueError, "hold capture conflict"):
+            self.ledger.capture_hold("captured", "capture-2", "merchant")
+        with self.assertRaisesRegex(ValueError, "hold capture conflict"):
+            self.ledger.capture_hold("captured", "capture-1", "other-merchant")
+
+        self.ledger.place_hold("released", "wallet", 100)
+        self.ledger.release_hold("released")
+        with self.assertRaisesRegex(ValueError, "released hold cannot be captured"):
+            self.ledger.capture_hold("released", "capture-2", "merchant")
+
+        self.ledger.place_hold("active", "wallet", 100)
+        self.ledger.post("existing", [("wallet", -100), ("merchant", 100)])
+        with self.assertRaisesRegex(ValueError, "transaction ID conflict"):
+            self.ledger.capture_hold("active", "existing", "merchant")
+        active = self.ledger.hold("active")
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.assertTrue(active.active)
+        self.assertEqual(self.ledger.balance("wallet"), 200)
+
+    def test_hold_capture_validates_inputs_without_mutation(self):
+        self.ledger.post("fund", [("clearing", -100), ("wallet", 100)])
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.place_hold("hold-1", "wallet", 100)
+
+        for hold_id, transaction_id, destination in (
+            ("", "capture", "merchant"),
+            ("hold-1", "", "merchant"),
+            ("hold-1", "capture", ""),
+            ("hold-1", "capture", "wallet"),
+        ):
+            with self.subTest(
+                hold_id=hold_id, transaction_id=transaction_id, destination=destination
+            ):
+                with self.assertRaises(ValueError):
+                    self.ledger.capture_hold(hold_id, transaction_id, destination)
+        with self.assertRaisesRegex(ValueError, "unknown hold ID"):
+            self.ledger.capture_hold("missing", "capture", "merchant")
+
+        self.assertEqual(self.ledger.available_balance("wallet"), 0)
+        self.assertIsNone(self.ledger.transaction("capture"))
+
+    def test_existing_hold_schema_is_migrated_for_capture(self):
+        legacy_path = Path(self.tmp.name) / "legacy.sqlite3"
+        with sqlite3.connect(legacy_path) as db:
+            db.execute(
+                "CREATE TABLE transactions (tx_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+            )
+            db.execute(
+                """CREATE TABLE account_holds (
+                    hold_id TEXT PRIMARY KEY,
+                    account TEXT NOT NULL,
+                    amount INTEGER NOT NULL CHECK(amount > 0),
+                    active INTEGER NOT NULL CHECK(active IN (0, 1))
+                )"""
+            )
+
+        migrated = Ledger(legacy_path)
+
+        with sqlite3.connect(legacy_path) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(account_holds)")}
+        self.assertIn("captured_tx_id", columns)
+        self.assertIsNone(migrated.hold("missing"))
 
     def test_transaction_audit_lookup_returns_complete_deterministic_record(self):
         self.ledger.post("tx-1", [("wallet", -125), ("merchant", 100), ("fee", 25)])
