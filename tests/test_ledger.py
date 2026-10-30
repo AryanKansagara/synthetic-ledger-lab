@@ -5,8 +5,10 @@ import hmac
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from synthetic_ledger_lab.ledger import AccountHold, Ledger
 
@@ -24,6 +26,30 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(Ledger(self.path).post("tx-1", entries))
         self.assertEqual(self.ledger.balance("user-cash"), 1250)
         self.assertEqual(self.ledger.balance("synthetic-cash"), -1250)
+
+    def test_connections_close_after_success_and_failure(self):
+        def tracked_connection() -> mock.MagicMock:
+            connection = sqlite3.connect(self.path)
+            tracked = mock.MagicMock(wraps=connection)
+            tracked.__enter__.return_value = connection
+            tracked.__exit__.side_effect = connection.__exit__
+            return tracked
+
+        successful = tracked_connection()
+        with mock.patch(
+            "synthetic_ledger_lab.ledger.sqlite3.connect", return_value=successful
+        ):
+            self.assertEqual(self.ledger.balance("missing"), 0)
+        successful.close.assert_called_once_with()
+
+        self.ledger.post("tx-close", [("a", -1), ("b", 1)])
+        failed = tracked_connection()
+        with mock.patch(
+            "synthetic_ledger_lab.ledger.sqlite3.connect", return_value=failed
+        ):
+            with self.assertRaisesRegex(ValueError, "transaction ID conflict"):
+                self.ledger.post("tx-close", [("a", -2), ("b", 2)])
+        failed.close.assert_called_once_with()
 
     def test_unbalanced_postings_are_rejected_without_mutation(self):
         with self.assertRaisesRegex(ValueError, "balance to zero"):
@@ -429,7 +455,7 @@ class LedgerTests(unittest.TestCase):
 
     def test_existing_hold_schema_is_migrated_for_capture(self):
         legacy_path = Path(self.tmp.name) / "legacy.sqlite3"
-        with sqlite3.connect(legacy_path) as db:
+        with closing(sqlite3.connect(legacy_path)) as db, db:
             db.execute(
                 "CREATE TABLE transactions (tx_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
             )
@@ -444,7 +470,7 @@ class LedgerTests(unittest.TestCase):
 
         migrated = Ledger(legacy_path)
 
-        with sqlite3.connect(legacy_path) as db:
+        with closing(sqlite3.connect(legacy_path)) as db, db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(account_holds)")}
         self.assertIn("captured_tx_id", columns)
         self.assertIn("expires_at", columns)

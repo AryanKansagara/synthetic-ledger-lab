@@ -10,7 +10,8 @@ import re
 import sqlite3
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,6 +97,19 @@ _CANONICAL_INTEGER = re.compile(r"-?[1-9][0-9]*\Z")
 _MAX_RECONCILIATION_BYTES = 10 * 1024 * 1024
 
 
+@contextmanager
+def _connect(
+    path: str | Path, *, timeout: float = 5.0
+) -> Iterator[sqlite3.Connection]:
+    """Open a transactional SQLite connection and always close it."""
+    db = sqlite3.connect(path, timeout=timeout)
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
+
+
 def _validate_signing_key(signing_key: bytes) -> None:
     if not isinstance(signing_key, bytes) or len(signing_key) < 32:
         raise ValueError("signing_key must contain at least 32 bytes")
@@ -107,7 +121,7 @@ class Ledger:
     ):
         self.path = Path(path)
         self._clock = clock or (lambda: int(time.time()))
-        with sqlite3.connect(self.path) as db:
+        with _connect(self.path) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS transactions (
                 tx_id TEXT PRIMARY KEY, payload TEXT NOT NULL
             )""")
@@ -197,7 +211,7 @@ class Ledger:
         injected integer Unix-time clock and is idempotent across retries.
         """
         now = self._now()
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             return self._expire_holds_in_connection(db, now)
 
@@ -215,7 +229,7 @@ class Ledger:
         ):
             raise ValueError("minimum_balance must be a signed 64-bit integer or None")
 
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             self._expire_holds_in_connection(db, self._now(), account)
             if minimum_balance is None:
@@ -239,7 +253,7 @@ class Ledger:
     def minimum_balance(self, account: str) -> int | None:
         """Return an account's configured balance floor, or ``None`` if unrestricted."""
         self._validate_account(account)
-        with sqlite3.connect(self.path) as db:
+        with _connect(self.path) as db:
             row = db.execute(
                 "SELECT minimum_balance FROM account_policies WHERE account = ?",
                 (account,),
@@ -274,7 +288,7 @@ class Ledger:
                 "expires_at must be a non-negative signed 64-bit integer or None"
             )
 
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             now = self._now()
             self._expire_holds_in_connection(db, now, account)
@@ -311,7 +325,7 @@ class Ledger:
         """Release a hold once; return ``False`` when it was already released."""
         if not isinstance(hold_id, str) or not hold_id.strip():
             raise ValueError("hold_id must be a non-empty string")
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             self._expire_holds_in_connection(db, self._now())
             row = db.execute(
@@ -348,7 +362,7 @@ class Ledger:
             raise ValueError("transaction_id must be a non-empty string")
         self._validate_account(destination_account)
 
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("BEGIN IMMEDIATE")
             self._expire_holds_in_connection(db, self._now())
@@ -420,7 +434,7 @@ class Ledger:
         """Return a hold for operational audit, including inactive holds."""
         if not isinstance(hold_id, str) or not hold_id.strip():
             raise ValueError("hold_id must be a non-empty string")
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             self._expire_holds_in_connection(db, self._now())
             row = db.execute(
@@ -483,7 +497,7 @@ class Ledger:
             clauses.append(states[state])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             self._expire_holds_in_connection(db, self._now(), account)
             rows = db.execute(
@@ -509,7 +523,7 @@ class Ledger:
     def available_balance(self, account: str) -> int:
         """Return current balance less all active holds for an account."""
         self._validate_account(account)
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             self._expire_holds_in_connection(db, self._now(), account)
             return self._balance_in_connection(
@@ -539,7 +553,7 @@ class Ledger:
             raise ValueError("postings must balance to zero")
         payload = json.dumps(normalized, separators=(",", ":"))
 
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with _connect(self.path, timeout=10) as db:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("BEGIN IMMEDIATE")
             now = self._now()
@@ -584,14 +598,14 @@ class Ledger:
         account's running total may not. Sum in Python so valid histories stay
         readable after crossing that boundary.
         """
-        with sqlite3.connect(self.path) as db:
+        with _connect(self.path) as db:
             return self._balance_in_connection(db, account)
 
     def transaction(self, transaction_id: str) -> LedgerTransaction | None:
         """Return one transaction for audit, or ``None`` when it does not exist."""
         if not isinstance(transaction_id, str) or not transaction_id.strip():
             raise ValueError("transaction_id must be a non-empty string")
-        with sqlite3.connect(self.path) as db:
+        with _connect(self.path) as db:
             exists = db.execute(
                 "SELECT 1 FROM transactions WHERE tx_id = ?", (transaction_id,)
             ).fetchone()
@@ -641,7 +655,7 @@ class Ledger:
             parameters.append(account)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
-        with sqlite3.connect(self.path) as db:
+        with _connect(self.path) as db:
             transaction_ids = [
                 row[0]
                 for row in db.execute(
@@ -693,7 +707,7 @@ class Ledger:
         if signing_key is not None:
             _validate_signing_key(signing_key)
 
-        with sqlite3.connect(self.path) as db:
+        with _connect(self.path) as db:
             rows = db.execute(
                 """SELECT tx_id, account, amount
                    FROM postings
@@ -810,7 +824,7 @@ class Ledger:
         except csv.Error as error:
             raise ValueError("malformed reconciliation CSV") from error
 
-        with sqlite3.connect(self.path) as db:
+        with _connect(self.path) as db:
             ledger = {
                 (transaction_id, account): amount
                 for transaction_id, account, amount in db.execute(
