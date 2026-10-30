@@ -352,6 +352,81 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "clock must return"):
             Ledger(self.path, clock=lambda: True).expire_holds()
 
+    def test_hold_pages_use_stable_keyset_and_account_filter(self):
+        self.ledger.post(
+            "fund", [("clearing", -501), ("wallet", 500), ("other-wallet", 1)]
+        )
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.set_minimum_balance("other-wallet", 0)
+        for hold_id, account, amount in (
+            ("hold-c", "wallet", 100),
+            ("hold-a", "wallet", 100),
+            ("hold-b", "other-wallet", 1),
+        ):
+            self.ledger.place_hold(hold_id, account, amount)
+
+        first = self.ledger.holds(limit=2)
+        second = self.ledger.holds(limit=2, after=first.next_cursor)
+
+        self.assertEqual([hold.hold_id for hold in first.holds], ["hold-a", "hold-b"])
+        self.assertEqual(first.next_cursor, "hold-b")
+        self.assertEqual([hold.hold_id for hold in second.holds], ["hold-c"])
+        self.assertIsNone(second.next_cursor)
+        self.assertEqual(
+            [hold.hold_id for hold in self.ledger.holds(account="wallet").holds],
+            ["hold-a", "hold-c"],
+        )
+
+    def test_hold_pages_filter_current_lifecycle_state(self):
+        now = [100]
+        ledger = Ledger(self.path, clock=lambda: now[0])
+        ledger.post("fund", [("clearing", -500), ("wallet", 500)])
+        ledger.set_minimum_balance("wallet", 0)
+        ledger.place_hold("active", "wallet", 100)
+        ledger.place_hold("captured", "wallet", 100)
+        ledger.capture_hold("captured", "capture", "merchant")
+        ledger.place_hold("released", "wallet", 100)
+        ledger.release_hold("released")
+        ledger.place_hold("expired", "wallet", 100, expires_at=101)
+        now[0] = 101
+
+        for state, expected in (
+            ("active", ["active"]),
+            ("captured", ["captured"]),
+            ("released", ["released"]),
+            ("expired", ["expired"]),
+        ):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    [hold.hold_id for hold in ledger.holds(state=state).holds],
+                    expected,
+                )
+        self.assertEqual(ledger.available_balance("wallet"), 300)
+
+    def test_hold_pages_validate_queries_without_changing_active_holds(self):
+        self.ledger.post("fund", [("clearing", -1), ("wallet", 1)])
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.place_hold("hold-1", "wallet", 1)
+
+        invalid_limits: tuple[Any, ...] = (True, 0, 101, 1.5)
+        for invalid in invalid_limits:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.ledger.holds(limit=invalid)
+        invalid_queries: tuple[dict[str, Any], ...] = (
+            {"after": ""},
+            {"account": ""},
+            {"state": "unknown"},
+        )
+        for arguments in invalid_queries:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    self.ledger.holds(**arguments)
+
+        self.assertEqual(
+            self.ledger.hold("hold-1"), AccountHold("hold-1", "wallet", 1, True)
+        )
+
     def test_existing_hold_schema_is_migrated_for_capture(self):
         legacy_path = Path(self.tmp.name) / "legacy.sqlite3"
         with sqlite3.connect(legacy_path) as db:

@@ -94,6 +94,26 @@ Expiration is process-driven rather than an external scheduler guarantee.
 Partial capture, authorization, external payment-rail semantics, and distributed
 locking remain explicitly out of scope.
 
+Operational consumers can traverse durable holds in hold-ID order with bounded
+keyset pagination. Queries can be restricted to an account or to the `active`,
+`released`, `captured`, or `expired` lifecycle state:
+
+```python
+page = ledger.holds(limit=50, account="demo-wallet", state="active")
+if page.next_cursor is not None:
+    next_page = ledger.holds(
+        limit=50,
+        account="demo-wallet",
+        state="active",
+        after=page.next_cursor,
+    )
+```
+
+Hold queries first durably expire due records, so lifecycle filters reflect the
+injected clock at query time. As with transaction queries, traversal is not a
+frozen snapshot: concurrent inserts and lifecycle transitions can affect later
+pages. Limits are restricted to 1–100 holds.
+
 ## Transaction audit queries
 
 Operational consumers can retrieve one immutable transaction or traverse the
