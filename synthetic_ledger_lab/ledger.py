@@ -83,6 +83,14 @@ class AccountHold:
     expired_at: int | None = None
 
 
+@dataclass(frozen=True)
+class HoldPage:
+    """A keyset-paginated page of durable account holds."""
+
+    holds: tuple[AccountHold, ...]
+    next_cursor: str | None
+
+
 _RECONCILIATION_HEADER = ("transaction_id", "account", "amount_minor")
 _CANONICAL_INTEGER = re.compile(r"-?[1-9][0-9]*\Z")
 _MAX_RECONCILIATION_BYTES = 10 * 1024 * 1024
@@ -427,6 +435,75 @@ class Ledger:
             else AccountHold(
                 row[0], row[1], row[2], bool(row[3]), row[4], row[5], row[6]
             )
+        )
+
+    def holds(
+        self,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+        account: str | None = None,
+        state: str | None = None,
+    ) -> HoldPage:
+        """Return a deterministic keyset page for hold audit workflows.
+
+        Holds are ordered by ID. Optional filters select one account or one of
+        ``active``, ``released``, ``captured``, and ``expired``. Due holds are
+        durably expired before the page is selected so state filters reflect the
+        injected clock at query time.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        if after is not None and (not isinstance(after, str) or not after.strip()):
+            raise ValueError("after must be a non-empty string or None")
+        if account is not None:
+            self._validate_account(account)
+        states = {
+            "active": "active = 1",
+            "released": (
+                "active = 0 AND captured_tx_id IS NULL AND expired_at IS NULL"
+            ),
+            "captured": "captured_tx_id IS NOT NULL",
+            "expired": "expired_at IS NOT NULL",
+        }
+        if state is not None and state not in states:
+            raise ValueError(
+                "state must be active, released, captured, expired, or None"
+            )
+
+        clauses: list[str] = []
+        parameters: list[str | int] = []
+        if after is not None:
+            clauses.append("hold_id > ?")
+            parameters.append(after)
+        if account is not None:
+            clauses.append("account = ?")
+            parameters.append(account)
+        if state is not None:
+            clauses.append(states[state])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with sqlite3.connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now(), account)
+            rows = db.execute(
+                f"""SELECT hold_id, account, amount, active, captured_tx_id,
+                           expires_at, expired_at
+                    FROM account_holds {where}
+                    ORDER BY hold_id LIMIT ?""",
+                (*parameters, limit + 1),
+            ).fetchall()
+
+        page_rows = rows[:limit]
+        holds = tuple(
+            AccountHold(
+                row[0], row[1], row[2], bool(row[3]), row[4], row[5], row[6]
+            )
+            for row in page_rows
+        )
+        return HoldPage(
+            holds=holds,
+            next_cursor=page_rows[-1][0] if len(rows) > limit else None,
         )
 
     def available_balance(self, account: str) -> int:
