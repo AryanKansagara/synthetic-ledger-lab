@@ -151,16 +151,31 @@ curl 'http://127.0.0.1:8080/transactions?account=demo-wallet&limit=50'
 curl 'http://127.0.0.1:8080/holds?state=active&limit=50'
 ```
 
+To exercise the authentication boundary without placing a secret in the command
+line, read a bearer token from an environment variable. `/health` remains public;
+all transaction and hold routes then require the exact token:
+
+```bash
+export LEDGER_API_TOKEN='replace-with-a-random-demo-secret'
+python3 -m synthetic_ledger_lab.http demo.sqlite3 --api-token-env LEDGER_API_TOKEN
+curl -H "Authorization: Bearer $LEDGER_API_TOKEN" \
+  'http://127.0.0.1:8080/transactions?limit=50'
+```
+
 Available routes are `/health`, `/transactions`, `/transactions/{id}`, `/holds`,
 and `/holds/{id}`. Collection routes preserve the core's 1–100 item keyset
 pagination and filters. Unknown, duplicate, blank, or malformed parameters are
 rejected; non-`GET` methods cannot mutate the ledger. Responses are marked
 `Cache-Control: no-store`.
 
-This adapter intentionally defaults to loopback and has no TLS, authentication,
-authorization, production server, rate limiting, or frozen-snapshot guarantee.
-It is suitable only for local synthetic-data demonstrations; do not expose it to
-an untrusted network or use it with real financial or personal data.
+Bearer authentication is optional and deliberately narrow: the token is loaded
+from an environment variable rather than a CLI argument, checked with a
+constant-time comparison, and never included in response bodies. It is not
+account-scoped authorization or token rotation. The adapter still has no TLS,
+production server, rate limiting, or frozen-snapshot guarantee, defaults to
+loopback, and sends bearer credentials over plaintext HTTP. It is suitable only
+for local synthetic-data demonstrations; do not expose it to an untrusted
+network or use it with real financial or personal data.
 
 ## Reconciliation export
 

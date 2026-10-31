@@ -20,7 +20,12 @@ class AuditHttpTests(unittest.TestCase):
         self.app = create_app(self.ledger)
 
     def request(
-        self, path: str, *, query: str = "", method: str = "GET"
+        self,
+        path: str,
+        *,
+        query: str = "",
+        method: str = "GET",
+        authorization: str | None = None,
     ) -> tuple[str, dict[str, str], dict[str, Any]]:
         environ: dict[str, Any] = {}
         setup_testing_defaults(environ)
@@ -29,6 +34,8 @@ class AuditHttpTests(unittest.TestCase):
             PATH_INFO=path,
             QUERY_STRING=query,
         )
+        if authorization is not None:
+            environ["HTTP_AUTHORIZATION"] = authorization
         response_status = ""
         response_headers: list[tuple[str, str]] = []
 
@@ -50,6 +57,41 @@ class AuditHttpTests(unittest.TestCase):
         status, _, payload = self.request("/transactions", method="POST")
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(payload, {"error": "method not allowed"})
+
+    def test_optional_bearer_auth_protects_audit_routes_but_not_health(self):
+        self.app = create_app(self.ledger, api_token="synthetic-demo-token")
+
+        status, _, payload = self.request("/health")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload, {"status": "ok"})
+
+        for authorization in [
+            None,
+            "",
+            "Bearer wrong",
+            "bearer synthetic-demo-token",
+            "Bearer nōn-ascii",
+        ]:
+            with self.subTest(authorization=authorization):
+                status, headers, payload = self.request(
+                    "/transactions", authorization=authorization
+                )
+                self.assertEqual(status, "401 Unauthorized")
+                self.assertEqual(payload, {"error": "unauthorized"})
+                self.assertEqual(headers["WWW-Authenticate"], 'Bearer realm="ledger-audit"')
+                self.assertNotIn("synthetic-demo-token", json.dumps(payload))
+
+        status, _, payload = self.request(
+            "/transactions", authorization="Bearer synthetic-demo-token"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload["transactions"][0]["transaction_id"], "fund")
+
+    def test_bearer_token_configuration_rejects_unsafe_values(self):
+        for token in ["", "contains whitespace", "line\nbreak", "nōn-ascii"]:
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(ValueError, "api_token"):
+                    create_app(self.ledger, api_token=token)
 
     def test_transactions_support_exact_lookup_and_keyset_pagination(self):
         self.ledger.post("purchase", [("merchant", 250), ("wallet", -250)])
