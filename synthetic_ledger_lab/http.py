@@ -1,7 +1,9 @@
 """Dependency-free read-only HTTP adapter for synthetic ledger audit data."""
 
 import argparse
+import hmac
 import json
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import Any
@@ -14,7 +16,10 @@ StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 
 
 def _json_response(
-    start_response: StartResponse, status: str, payload: dict[str, Any]
+    start_response: StartResponse,
+    status: str,
+    payload: dict[str, Any],
+    extra_headers: list[tuple[str, str]] | None = None,
 ) -> list[bytes]:
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     start_response(
@@ -23,7 +28,8 @@ def _json_response(
             ("Content-Type", "application/json; charset=utf-8"),
             ("Content-Length", str(len(body))),
             ("Cache-Control", "no-store"),
-        ],
+        ]
+        + (extra_headers or []),
     )
     return [body]
 
@@ -71,17 +77,43 @@ def _hold_payload(hold: Any) -> dict[str, Any]:
     return payload
 
 
-def create_app(ledger: Ledger) -> Callable[[dict[str, Any], StartResponse], Iterable[bytes]]:
-    """Create a read-only WSGI app over one ledger instance."""
+def create_app(
+    ledger: Ledger, *, api_token: str | None = None
+) -> Callable[[dict[str, Any], StartResponse], Iterable[bytes]]:
+    """Create a read-only WSGI app, optionally protecting audit routes."""
+
+    if api_token is not None and (
+        not api_token
+        or not api_token.isascii()
+        or any(not 33 <= ord(char) <= 126 for char in api_token)
+    ):
+        raise ValueError(
+            "api_token must be non-empty ASCII with no whitespace or control characters"
+        )
 
     def app(environ: dict[str, Any], start_response: StartResponse) -> Iterable[bytes]:
+        path = environ.get("PATH_INFO", "")
+        if path != "/health" and api_token is not None:
+            expected = f"Bearer {api_token}"
+            supplied = environ.get("HTTP_AUTHORIZATION", "")
+            if (
+                not isinstance(supplied, str)
+                or not supplied.isascii()
+                or not hmac.compare_digest(supplied, expected)
+            ):
+                return _json_response(
+                    start_response,
+                    "401 Unauthorized",
+                    {"error": "unauthorized"},
+                    [("WWW-Authenticate", 'Bearer realm="ledger-audit"')],
+                )
+
         if environ.get("REQUEST_METHOD") != "GET":
             response = _json_response(
                 start_response, "405 Method Not Allowed", {"error": "method not allowed"}
             )
             return response
 
-        path = environ.get("PATH_INFO", "")
         try:
             if path == "/health":
                 if environ.get("QUERY_STRING"):
@@ -165,11 +197,25 @@ def main() -> None:
     parser.add_argument("database", help="path to the synthetic SQLite ledger")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--api-token-env",
+        metavar="NAME",
+        help="protect audit routes with a bearer token read from environment variable NAME",
+    )
     arguments = parser.parse_args()
     if not 1 <= arguments.port <= 65535:
         parser.error("--port must be from 1 to 65535")
 
-    app = create_app(Ledger(arguments.database))
+    api_token = None
+    if arguments.api_token_env is not None:
+        api_token = os.environ.get(arguments.api_token_env)
+        if not api_token:
+            parser.error(f"environment variable {arguments.api_token_env!r} is missing or empty")
+
+    try:
+        app = create_app(Ledger(arguments.database), api_token=api_token)
+    except ValueError as error:
+        parser.error(str(error))
     with make_server(arguments.host, arguments.port, app) as server:
         print(f"Serving read-only synthetic audit API on {arguments.host}:{arguments.port}")
         server.serve_forever()
