@@ -53,10 +53,58 @@ class AuditHttpTests(unittest.TestCase):
         self.assertEqual(payload, {"status": "ok"})
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(int(headers["Content-Length"]), len(b'{"status":"ok"}'))
+        self.assertEqual(len(headers["X-Request-ID"]), 32)
 
         status, _, payload = self.request("/transactions", method="POST")
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(payload, {"error": "method not allowed"})
+
+    def test_correlation_and_access_records_are_bounded_and_privacy_conscious(self):
+        records: list[dict[str, Any]] = []
+        self.app = create_app(
+            self.ledger,
+            api_token="synthetic-demo-token",
+            access_logger=records.append,
+            request_id_factory=lambda: "request-123",
+        )
+
+        status, headers, _ = self.request(
+            "/transactions/fund",
+            query="secret-query=value",
+            authorization="Bearer synthetic-demo-token",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(headers["X-Request-ID"], "request-123")
+        self.assertEqual(
+            records,
+            [
+                {
+                    "event": "audit_http_access",
+                    "method": "GET",
+                    "request_id": "request-123",
+                    "route": "/transactions/{id}",
+                    "status": 400,
+                }
+            ],
+        )
+        serialized = json.dumps(records)
+        self.assertNotIn("secret-query", serialized)
+        self.assertNotIn("synthetic-demo-token", serialized)
+        self.assertNotIn("fund", serialized)
+
+        self.request("/user-controlled/value/nested", method="DELETE")
+        self.assertEqual(records[-1]["method"], "OTHER")
+        self.assertEqual(records[-1]["route"], "unmatched")
+        self.assertEqual(records[-1]["status"], 401)
+
+    def test_request_id_factory_rejects_unsafe_values(self):
+        for request_id in ["", "space value", "line\nbreak", "nōn-ascii", "x" * 129]:
+            with self.subTest(request_id=request_id):
+                self.app = create_app(
+                    self.ledger, request_id_factory=lambda value=request_id: value
+                )
+                with self.assertRaisesRegex(ValueError, "request_id_factory"):
+                    self.request("/health")
 
     def test_optional_bearer_auth_protects_audit_routes_but_not_health(self):
         self.app = create_app(self.ledger, api_token="synthetic-demo-token")

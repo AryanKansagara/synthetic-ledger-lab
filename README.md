@@ -166,16 +166,21 @@ Available routes are `/health`, `/transactions`, `/transactions/{id}`, `/holds`,
 and `/holds/{id}`. Collection routes preserve the core's 1–100 item keyset
 pagination and filters. Unknown, duplicate, blank, or malformed parameters are
 rejected; non-`GET` methods cannot mutate the ledger. Responses are marked
-`Cache-Control: no-store`.
+`Cache-Control: no-store` and carry an application-generated `X-Request-ID`.
+The CLI emits one structured JSON access record per request to stderr. Records
+use bounded route templates, method classes and status codes; they deliberately
+omit query strings, resource IDs, headers, bearer credentials and response
+bodies.
 
 Bearer authentication is optional and deliberately narrow: the token is loaded
 from an environment variable rather than a CLI argument, checked with a
 constant-time comparison, and never included in response bodies. It is not
 account-scoped authorization or token rotation. The adapter still has no TLS,
-production server, rate limiting, or frozen-snapshot guarantee, defaults to
-loopback, and sends bearer credentials over plaintext HTTP. It is suitable only
-for local synthetic-data demonstrations; do not expose it to an untrusted
-network or use it with real financial or personal data.
+production server, log shipping/backpressure, rate limiting, or frozen-snapshot
+guarantee, defaults to loopback, and sends bearer credentials over plaintext
+HTTP. Request IDs correlate one process only and are not distributed traces. It
+is suitable only for local synthetic-data demonstrations; do not expose it to
+an untrusted network or use it with real financial or personal data.
 
 ## Reconciliation export
 
