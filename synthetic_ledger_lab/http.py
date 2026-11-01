@@ -4,6 +4,8 @@ import argparse
 import hmac
 import json
 import os
+import secrets
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import Any
@@ -13,6 +15,34 @@ from wsgiref.simple_server import make_server
 from synthetic_ledger_lab.ledger import Ledger
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
+AccessLogger = Callable[[dict[str, Any]], None]
+
+
+def _route(path: str) -> str:
+    if path in {"/health", "/transactions", "/holds"}:
+        return path
+    if path.startswith("/transactions/") and "/" not in path.removeprefix(
+        "/transactions/"
+    ):
+        return "/transactions/{id}"
+    if path.startswith("/holds/") and "/" not in path.removeprefix("/holds/"):
+        return "/holds/{id}"
+    return "unmatched"
+
+
+def _request_id(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 128
+        or not value.isascii()
+        or any(not 33 <= ord(char) <= 126 for char in value)
+    ):
+        raise ValueError("request_id_factory must return 1-128 visible ASCII characters")
+    return value
+
+
+def _stderr_access_logger(record: dict[str, Any]) -> None:
+    print(json.dumps(record, separators=(",", ":"), sort_keys=True), file=sys.stderr)
 
 
 def _json_response(
@@ -78,9 +108,13 @@ def _hold_payload(hold: Any) -> dict[str, Any]:
 
 
 def create_app(
-    ledger: Ledger, *, api_token: str | None = None
+    ledger: Ledger,
+    *,
+    api_token: str | None = None,
+    access_logger: AccessLogger | None = None,
+    request_id_factory: Callable[[], str] | None = None,
 ) -> Callable[[dict[str, Any], StartResponse], Iterable[bytes]]:
-    """Create a read-only WSGI app, optionally protecting audit routes."""
+    """Create a read-only WSGI app with optional auth and access records."""
 
     if api_token is not None and (
         not api_token
@@ -91,7 +125,11 @@ def create_app(
             "api_token must be non-empty ASCII with no whitespace or control characters"
         )
 
-    def app(environ: dict[str, Any], start_response: StartResponse) -> Iterable[bytes]:
+    make_request_id = request_id_factory or (lambda: secrets.token_hex(16))
+
+    def dispatch(
+        environ: dict[str, Any], start_response: StartResponse
+    ) -> Iterable[bytes]:
         path = environ.get("PATH_INFO", "")
         if path != "/health" and api_token is not None:
             expected = f"Bearer {api_token}"
@@ -189,6 +227,35 @@ def create_app(
                 start_response, "400 Bad Request", {"error": str(error)}
             )
 
+    def app(environ: dict[str, Any], start_response: StartResponse) -> Iterable[bytes]:
+        request_id = _request_id(make_request_id())
+        status_code = 500
+
+        def correlated_start_response(
+            status: str, headers: list[tuple[str, str]]
+        ) -> Any:
+            nonlocal status_code
+            try:
+                status_code = int(status.split(" ", 1)[0])
+            except (ValueError, IndexError):
+                status_code = 500
+            return start_response(status, headers + [("X-Request-ID", request_id)])
+
+        try:
+            return dispatch(environ, correlated_start_response)
+        finally:
+            if access_logger is not None:
+                method = environ.get("REQUEST_METHOD")
+                access_logger(
+                    {
+                        "event": "audit_http_access",
+                        "method": method if method in {"GET", "POST"} else "OTHER",
+                        "request_id": request_id,
+                        "route": _route(environ.get("PATH_INFO", "")),
+                        "status": status_code,
+                    }
+                )
+
     return app
 
 
@@ -213,7 +280,11 @@ def main() -> None:
             parser.error(f"environment variable {arguments.api_token_env!r} is missing or empty")
 
     try:
-        app = create_app(Ledger(arguments.database), api_token=api_token)
+        app = create_app(
+            Ledger(arguments.database),
+            api_token=api_token,
+            access_logger=_stderr_access_logger,
+        )
     except ValueError as error:
         parser.error(str(error))
     with make_server(arguments.host, arguments.port, app) as server:
