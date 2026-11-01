@@ -162,6 +162,12 @@ curl -H "Authorization: Bearer $LEDGER_API_TOKEN" \
   'http://127.0.0.1:8080/transactions?limit=50'
 ```
 
+The demo also applies a global process-local fixed-window limit to every
+non-health request, including failed authentication attempts. The default is
+120 requests per 60 seconds and can be adjusted with `--audit-rate-limit` and
+`--rate-window-seconds`. Rejected requests return `429` with `Retry-After`;
+`/health` remains available for liveness checks.
+
 Available routes are `/health`, `/transactions`, `/transactions/{id}`, `/holds`,
 and `/holds/{id}`. Collection routes preserve the core's 1–100 item keyset
 pagination and filters. Unknown, duplicate, blank, or malformed parameters are
@@ -176,11 +182,14 @@ Bearer authentication is optional and deliberately narrow: the token is loaded
 from an environment variable rather than a CLI argument, checked with a
 constant-time comparison, and never included in response bodies. It is not
 account-scoped authorization or token rotation. The adapter still has no TLS,
-production server, log shipping/backpressure, rate limiting, or frozen-snapshot
-guarantee, defaults to loopback, and sends bearer credentials over plaintext
-HTTP. Request IDs correlate one process only and are not distributed traces. It
-is suitable only for local synthetic-data demonstrations; do not expose it to
-an untrusted network or use it with real financial or personal data.
+production server, log shipping/backpressure, distributed or identity-aware
+rate limiting, or frozen-snapshot guarantee, defaults to loopback, and sends
+bearer credentials over plaintext HTTP. The in-memory global limit resets on
+restart, is not shared by multiple processes, and can let one client consume
+capacity for all clients. Request IDs correlate one process only and are not
+distributed traces. It is suitable only for local synthetic-data
+demonstrations; do not expose it to an untrusted network or use it with real
+financial or personal data.
 
 ## Reconciliation export
 

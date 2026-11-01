@@ -6,6 +6,8 @@ import json
 import os
 import secrets
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import Any
@@ -16,6 +18,43 @@ from synthetic_ledger_lab.ledger import Ledger
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 AccessLogger = Callable[[dict[str, Any]], None]
+
+
+class _FixedWindowRateLimiter:
+    """Thread-safe, process-local request limiter for the demo audit routes."""
+
+    def __init__(
+        self,
+        limit: int,
+        window_seconds: int,
+        clock: Callable[[], float],
+    ) -> None:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("audit_rate_limit must be a positive integer")
+        if type(window_seconds) is not int or window_seconds <= 0:
+            raise ValueError("rate_window_seconds must be a positive integer")
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._clock = clock
+        self._window_started: float | None = None
+        self._requests = 0
+        self._lock = threading.Lock()
+
+    def allow(self) -> tuple[bool, int]:
+        with self._lock:
+            now = self._clock()
+            if (
+                self._window_started is None
+                or now - self._window_started >= self.window_seconds
+            ):
+                self._window_started = now
+                self._requests = 0
+            elapsed = max(0.0, now - self._window_started)
+            retry_after = max(1, int(self.window_seconds - elapsed + 0.999))
+            if self._requests >= self.limit:
+                return False, retry_after
+            self._requests += 1
+            return True, retry_after
 
 
 def _route(path: str) -> str:
@@ -111,10 +150,13 @@ def create_app(
     ledger: Ledger,
     *,
     api_token: str | None = None,
+    audit_rate_limit: int = 120,
+    rate_window_seconds: int = 60,
+    rate_clock: Callable[[], float] | None = None,
     access_logger: AccessLogger | None = None,
     request_id_factory: Callable[[], str] | None = None,
 ) -> Callable[[dict[str, Any], StartResponse], Iterable[bytes]]:
-    """Create a read-only WSGI app with optional auth and access records."""
+    """Create a read-only WSGI app with auth, rate limits, and access records."""
 
     if api_token is not None and (
         not api_token
@@ -126,11 +168,26 @@ def create_app(
         )
 
     make_request_id = request_id_factory or (lambda: secrets.token_hex(16))
+    rate_limiter = _FixedWindowRateLimiter(
+        audit_rate_limit,
+        rate_window_seconds,
+        rate_clock or time.monotonic,
+    )
 
     def dispatch(
         environ: dict[str, Any], start_response: StartResponse
     ) -> Iterable[bytes]:
         path = environ.get("PATH_INFO", "")
+        if path != "/health":
+            allowed, retry_after = rate_limiter.allow()
+            if not allowed:
+                return _json_response(
+                    start_response,
+                    "429 Too Many Requests",
+                    {"error": "audit request rate limit exceeded"},
+                    [("Retry-After", str(retry_after))],
+                )
+
         if path != "/health" and api_token is not None:
             expected = f"Bearer {api_token}"
             supplied = environ.get("HTTP_AUTHORIZATION", "")
@@ -269,6 +326,18 @@ def main() -> None:
         metavar="NAME",
         help="protect audit routes with a bearer token read from environment variable NAME",
     )
+    parser.add_argument(
+        "--audit-rate-limit",
+        type=int,
+        default=120,
+        help="maximum non-health requests per process-local window (default: 120)",
+    )
+    parser.add_argument(
+        "--rate-window-seconds",
+        type=int,
+        default=60,
+        help="process-local rate-limit window in seconds (default: 60)",
+    )
     arguments = parser.parse_args()
     if not 1 <= arguments.port <= 65535:
         parser.error("--port must be from 1 to 65535")
@@ -283,6 +352,8 @@ def main() -> None:
         app = create_app(
             Ledger(arguments.database),
             api_token=api_token,
+            audit_rate_limit=arguments.audit_rate_limit,
+            rate_window_seconds=arguments.rate_window_seconds,
             access_logger=_stderr_access_logger,
         )
     except ValueError as error:

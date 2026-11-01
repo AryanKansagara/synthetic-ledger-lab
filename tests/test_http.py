@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from wsgiref.util import setup_testing_defaults
@@ -140,6 +141,83 @@ class AuditHttpTests(unittest.TestCase):
             with self.subTest(token=token):
                 with self.assertRaisesRegex(ValueError, "api_token"):
                     create_app(self.ledger, api_token=token)
+
+    def test_audit_rate_limit_counts_auth_failures_and_recovers_after_window(self):
+        now = 100.0
+        self.app = create_app(
+            self.ledger,
+            api_token="synthetic-demo-token",
+            audit_rate_limit=2,
+            rate_window_seconds=30,
+            rate_clock=lambda: now,
+        )
+
+        self.assertEqual(self.request("/transactions")[0], "401 Unauthorized")
+        self.assertEqual(
+            self.request("/holds", authorization="Bearer synthetic-demo-token")[0],
+            "200 OK",
+        )
+        status, headers, payload = self.request(
+            "/transactions", authorization="Bearer synthetic-demo-token"
+        )
+        self.assertEqual(status, "429 Too Many Requests")
+        self.assertEqual(headers["Retry-After"], "30")
+        self.assertEqual(payload, {"error": "audit request rate limit exceeded"})
+
+        now += 29.2
+        status, headers, _ = self.request(
+            "/transactions", authorization="Bearer synthetic-demo-token"
+        )
+        self.assertEqual(status, "429 Too Many Requests")
+        self.assertEqual(headers["Retry-After"], "1")
+
+        now += 0.8
+        self.assertEqual(
+            self.request(
+                "/transactions", authorization="Bearer synthetic-demo-token"
+            )[0],
+            "200 OK",
+        )
+
+    def test_health_is_not_rate_limited(self):
+        self.app = create_app(
+            self.ledger,
+            audit_rate_limit=1,
+            rate_window_seconds=60,
+            rate_clock=lambda: 100.0,
+        )
+
+        self.assertEqual(self.request("/transactions")[0], "200 OK")
+        self.assertEqual(self.request("/transactions")[0], "429 Too Many Requests")
+        for _ in range(3):
+            self.assertEqual(self.request("/health")[0], "200 OK")
+
+    def test_rate_limit_is_atomic_for_competing_requests(self):
+        self.app = create_app(
+            self.ledger,
+            audit_rate_limit=5,
+            rate_window_seconds=60,
+            rate_clock=lambda: 100.0,
+        )
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            statuses = list(
+                executor.map(lambda _: self.request("/transactions")[0], range(20))
+            )
+
+        self.assertEqual(statuses.count("200 OK"), 5)
+        self.assertEqual(statuses.count("429 Too Many Requests"), 15)
+
+    def test_rate_limit_configuration_must_be_positive_integers(self):
+        for options in [
+            {"audit_rate_limit": 0},
+            {"audit_rate_limit": True},
+            {"rate_window_seconds": 0},
+            {"rate_window_seconds": 1.5},
+        ]:
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    create_app(self.ledger, **options)
 
     def test_transactions_support_exact_lookup_and_keyset_pagination(self):
         self.ledger.post("purchase", [("merchant", 250), ("wallet", -250)])
