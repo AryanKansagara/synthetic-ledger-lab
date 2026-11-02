@@ -49,6 +49,23 @@ class AuditHttpTests(unittest.TestCase):
         body = b"".join(self.app(environ, start_response))
         return response_status, dict(response_headers), json.loads(body)
 
+    def raw_request(
+        self, path: str, *, query: str = "", method: str = "GET"
+    ) -> tuple[str, dict[str, str], bytes]:
+        environ: dict[str, Any] = {}
+        setup_testing_defaults(environ)
+        environ.update(REQUEST_METHOD=method, PATH_INFO=path, QUERY_STRING=query)
+        response_status = ""
+        response_headers: list[tuple[str, str]] = []
+
+        def start_response(status, headers):
+            nonlocal response_status, response_headers
+            response_status = status
+            response_headers = headers
+
+        body = b"".join(self.app(environ, start_response))
+        return response_status, dict(response_headers), body
+
     def test_health_and_read_only_method_boundary(self):
         status, headers, payload = self.request("/health")
         self.assertEqual(status, "200 OK")
@@ -139,6 +156,70 @@ class AuditHttpTests(unittest.TestCase):
         self.assertEqual(records[-1]["method"], "OTHER")
         self.assertEqual(records[-1]["route"], "unmatched")
         self.assertEqual(records[-1]["status"], 401)
+
+    def test_metrics_are_public_prometheus_compatible_and_have_bounded_labels(self):
+        monotonic_values = iter((1.0, 1.125, 2.0, 2.25, 3.0, 3.375, 4.0, 4.5))
+        self.app = create_app(
+            self.ledger,
+            api_token="synthetic-demo-token",
+            audit_rate_limit=1,
+            rate_clock=lambda: 100.0,
+            metrics_clock=lambda: next(monotonic_values),
+        )
+
+        self.request("/health")
+        self.request("/transactions/secret-id")
+        self.request("/customer/secret-id", method="ATTACKER-CONTROLLED")
+        status, headers, body = self.raw_request("/metrics")
+
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            headers["Content-Type"], "text/plain; version=0.0.4; charset=utf-8"
+        )
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        text = body.decode()
+        self.assertIn("# TYPE ledger_audit_http_requests_total counter", text)
+        self.assertIn(
+            'ledger_audit_http_requests_total{method="GET",route="/health",status="200"} 1',
+            text,
+        )
+        self.assertIn(
+            'ledger_audit_http_requests_total{method="GET",route="/transactions/{id}",status="401"} 1',
+            text,
+        )
+        self.assertIn(
+            'ledger_audit_http_requests_total{method="OTHER",route="unmatched",status="429"} 1',
+            text,
+        )
+        self.assertIn(
+            'ledger_audit_http_request_duration_seconds_sum{method="GET",route="/health",status="200"} 0.125000',
+            text,
+        )
+        self.assertNotIn("ATTACKER-CONTROLLED", text)
+        self.assertNotIn("customer", text)
+        self.assertNotIn("secret-id", text)
+
+    def test_metrics_endpoint_contract_and_scrapes_are_observed(self):
+        self.assertEqual(
+            self.raw_request("/metrics", method="POST")[0],
+            "405 Method Not Allowed",
+        )
+        status, _, payload = self.request("/metrics", query="secret=value")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(
+            payload, {"error": "metrics endpoint does not accept query parameters"}
+        )
+
+        status, _, body = self.raw_request("/metrics")
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            b'ledger_audit_http_requests_total{method="POST",route="/metrics",status="405"} 1',
+            body,
+        )
+        self.assertIn(
+            b'ledger_audit_http_requests_total{method="GET",route="/metrics",status="400"} 1',
+            body,
+        )
 
     def test_request_id_factory_rejects_unsafe_values(self):
         for request_id in ["", "space value", "line\nbreak", "nōn-ascii", "x" * 129]:
