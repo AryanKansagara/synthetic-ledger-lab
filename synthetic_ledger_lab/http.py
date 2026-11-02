@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -18,6 +19,36 @@ from synthetic_ledger_lab.ledger import Ledger
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 AccessLogger = Callable[[dict[str, Any]], None]
+
+
+class _ShutdownState:
+    """Coordinate readiness withdrawal and one non-blocking server shutdown."""
+
+    def __init__(self) -> None:
+        self._ready = threading.Event()
+        self._ready.set()
+        self._shutdown_started = threading.Event()
+
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
+    def begin(self, shutdown: Callable[[], None]) -> None:
+        self._ready.clear()
+        if self._shutdown_started.is_set():
+            return
+        self._shutdown_started.set()
+        threading.Thread(target=shutdown, name="audit-http-shutdown", daemon=True).start()
+
+
+def _shutdown_handler(
+    state: _ShutdownState, shutdown: Callable[[], None]
+) -> Callable[[int, Any], None]:
+    """Build a handler that avoids calling shutdown from serve_forever's thread."""
+
+    def handle_signal(_signum: int, _frame: Any) -> None:
+        state.begin(shutdown)
+
+    return handle_signal
 
 
 class _FixedWindowRateLimiter:
@@ -58,7 +89,7 @@ class _FixedWindowRateLimiter:
 
 
 def _route(path: str) -> str:
-    if path in {"/health", "/transactions", "/holds"}:
+    if path in {"/health", "/ready", "/transactions", "/holds"}:
         return path
     if path.startswith("/transactions/") and "/" not in path.removeprefix(
         "/transactions/"
@@ -155,6 +186,7 @@ def create_app(
     rate_clock: Callable[[], float] | None = None,
     access_logger: AccessLogger | None = None,
     request_id_factory: Callable[[], str] | None = None,
+    readiness: Callable[[], bool] | None = None,
 ) -> Callable[[dict[str, Any], StartResponse], Iterable[bytes]]:
     """Create a read-only WSGI app with auth, rate limits, and access records."""
 
@@ -168,6 +200,7 @@ def create_app(
         )
 
     make_request_id = request_id_factory or (lambda: secrets.token_hex(16))
+    is_ready = readiness or (lambda: True)
     rate_limiter = _FixedWindowRateLimiter(
         audit_rate_limit,
         rate_window_seconds,
@@ -178,7 +211,7 @@ def create_app(
         environ: dict[str, Any], start_response: StartResponse
     ) -> Iterable[bytes]:
         path = environ.get("PATH_INFO", "")
-        if path != "/health":
+        if path not in {"/health", "/ready"}:
             allowed, retry_after = rate_limiter.allow()
             if not allowed:
                 return _json_response(
@@ -188,7 +221,7 @@ def create_app(
                     [("Retry-After", str(retry_after))],
                 )
 
-        if path != "/health" and api_token is not None:
+        if path not in {"/health", "/ready"} and api_token is not None:
             expected = f"Bearer {api_token}"
             supplied = environ.get("HTTP_AUTHORIZATION", "")
             if (
@@ -214,6 +247,17 @@ def create_app(
                 if environ.get("QUERY_STRING"):
                     raise ValueError("health endpoint does not accept query parameters")
                 return _json_response(start_response, "200 OK", {"status": "ok"})
+
+            if path == "/ready":
+                if environ.get("QUERY_STRING"):
+                    raise ValueError("readiness endpoint does not accept query parameters")
+                if is_ready():
+                    return _json_response(start_response, "200 OK", {"status": "ready"})
+                return _json_response(
+                    start_response,
+                    "503 Service Unavailable",
+                    {"status": "unavailable"},
+                )
 
             if path == "/transactions":
                 query = _query(environ, {"limit", "after", "account"})
@@ -349,16 +393,21 @@ def main() -> None:
             parser.error(f"environment variable {arguments.api_token_env!r} is missing or empty")
 
     try:
+        shutdown_state = _ShutdownState()
         app = create_app(
             Ledger(arguments.database),
             api_token=api_token,
             audit_rate_limit=arguments.audit_rate_limit,
             rate_window_seconds=arguments.rate_window_seconds,
             access_logger=_stderr_access_logger,
+            readiness=shutdown_state.ready,
         )
     except ValueError as error:
         parser.error(str(error))
     with make_server(arguments.host, arguments.port, app) as server:
+        handle_shutdown = _shutdown_handler(shutdown_state, server.shutdown)
+        signal.signal(signal.SIGTERM, handle_shutdown)
+        signal.signal(signal.SIGINT, handle_shutdown)
         print(f"Serving read-only synthetic audit API on {arguments.host}:{arguments.port}")
         server.serve_forever()
 
