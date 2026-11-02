@@ -168,7 +168,7 @@ non-health request, including failed authentication attempts. The default is
 `--rate-window-seconds`. Rejected requests return `429` with `Retry-After`;
 `/health` remains available for liveness checks.
 
-Available routes are `/health`, `/transactions`, `/transactions/{id}`, `/holds`,
+Available routes are `/health`, `/ready`, `/transactions`, `/transactions/{id}`, `/holds`,
 and `/holds/{id}`. Collection routes preserve the core's 1–100 item keyset
 pagination and filters. Unknown, duplicate, blank, or malformed parameters are
 rejected; non-`GET` methods cannot mutate the ledger. Responses are marked
@@ -190,6 +190,15 @@ capacity for all clients. Request IDs correlate one process only and are not
 distributed traces. It is suitable only for local synthetic-data
 demonstrations; do not expose it to an untrusted network or use it with real
 financial or personal data.
+
+`/health` reports process liveness. Public `/ready` reports whether the demo is
+still accepting traffic. On `SIGTERM` or `SIGINT`, the CLI first changes
+readiness to `503`, then asks the standard-library server to stop from a separate
+thread so `serve_forever()` cannot deadlock in its signal handler. Repeated
+signals are idempotent. This is lifecycle signaling for a local single-process
+demo, not production connection draining: a supervisor or load balancer must
+stop routing traffic after readiness withdrawal and allow in-flight requests to
+finish before enforcing its own termination deadline.
 
 ## Reconciliation export
 

@@ -1,12 +1,13 @@
 import json
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from wsgiref.util import setup_testing_defaults
 
-from synthetic_ledger_lab.http import create_app
+from synthetic_ledger_lab.http import _ShutdownState, _shutdown_handler, create_app
 from synthetic_ledger_lab.ledger import Ledger
 
 
@@ -59,6 +60,47 @@ class AuditHttpTests(unittest.TestCase):
         status, _, payload = self.request("/transactions", method="POST")
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(payload, {"error": "method not allowed"})
+
+    def test_readiness_is_public_unlimited_and_withdrawn_during_shutdown(self):
+        state = _ShutdownState()
+        self.app = create_app(
+            self.ledger,
+            api_token="synthetic-demo-token",
+            audit_rate_limit=1,
+            rate_clock=lambda: 100.0,
+            readiness=state.ready,
+        )
+
+        for _ in range(3):
+            status, _, payload = self.request("/ready")
+            self.assertEqual((status, payload), ("200 OK", {"status": "ready"}))
+
+        state.begin(lambda: None)
+        status, _, payload = self.request("/ready")
+        self.assertEqual(
+            (status, payload),
+            ("503 Service Unavailable", {"status": "unavailable"}),
+        )
+        self.assertEqual(self.request("/health")[0], "200 OK")
+
+    def test_shutdown_handler_is_idempotent_and_runs_shutdown_off_signal_thread(self):
+        state = _ShutdownState()
+        shutdown_called = threading.Event()
+        call_threads: list[int] = []
+
+        def shutdown():
+            call_threads.append(threading.get_ident())
+            shutdown_called.set()
+
+        handler = _shutdown_handler(state, shutdown)
+        signal_thread = threading.get_ident()
+        handler(15, None)
+        handler(15, None)
+
+        self.assertTrue(shutdown_called.wait(timeout=1))
+        self.assertFalse(state.ready())
+        self.assertEqual(len(call_threads), 1)
+        self.assertNotEqual(call_threads[0], signal_thread)
 
     def test_correlation_and_access_records_are_bounded_and_privacy_conscious(self):
         records: list[dict[str, Any]] = []
@@ -275,6 +317,7 @@ class AuditHttpTests(unittest.TestCase):
             ("/holds", "state=pending", "state must be"),
             ("/holds", "badfield", "malformed query string"),
             ("/health", "check=true", "does not accept"),
+            ("/ready", "check=true", "does not accept"),
         ]
         for path, query, message in cases:
             with self.subTest(path=path, query=query):
