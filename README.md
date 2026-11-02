@@ -168,8 +168,9 @@ non-health request, including failed authentication attempts. The default is
 `--rate-window-seconds`. Rejected requests return `429` with `Retry-After`;
 `/health` remains available for liveness checks.
 
-Available routes are `/health`, `/ready`, `/transactions`, `/transactions/{id}`, `/holds`,
-and `/holds/{id}`. Collection routes preserve the core's 1–100 item keyset
+Available routes are `/health`, `/ready`, `/metrics`, `/transactions`,
+`/transactions/{id}`, `/holds`, and `/holds/{id}`. Collection routes preserve
+the core's 1–100 item keyset
 pagination and filters. Unknown, duplicate, blank, or malformed parameters are
 rejected; non-`GET` methods cannot mutate the ledger. Responses are marked
 `Cache-Control: no-store` and carry an application-generated `X-Request-ID`.
@@ -190,6 +191,16 @@ capacity for all clients. Request IDs correlate one process only and are not
 distributed traces. It is suitable only for local synthetic-data
 demonstrations; do not expose it to an untrusted network or use it with real
 financial or personal data.
+
+Public `/metrics` exposes dependency-free Prometheus text-format counters and
+request-duration summaries. Labels are limited to method classes, route
+templates, and response status; resource IDs, query strings, credentials, and
+other user-controlled values are excluded. Metrics are process-local, reset on
+restart, and include failed authentication and rate-limited requests. The
+endpoint itself is intentionally public and outside the demo rate limit so a
+local scraper can observe saturation; protect it at the network boundary in a
+real deployment. Duration summaries provide counts and sums, not quantiles or
+histograms, and a scrape reports completed requests before that scrape.
 
 `/health` reports process liveness. Public `/ready` reports whether the demo is
 still accepting traffic. On `SIGTERM` or `SIGINT`, the CLI first changes

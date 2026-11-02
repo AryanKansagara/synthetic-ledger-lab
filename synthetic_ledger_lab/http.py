@@ -88,8 +88,48 @@ class _FixedWindowRateLimiter:
             return True, retry_after
 
 
+class _RequestMetrics:
+    """Thread-safe request totals and duration sums with bounded labels."""
+
+    def __init__(self) -> None:
+        self._values: dict[tuple[str, str, int], tuple[int, float]] = {}
+        self._lock = threading.Lock()
+
+    def observe(self, method: str, route: str, status: int, duration_seconds: float) -> None:
+        key = (method, route, status)
+        with self._lock:
+            count, duration = self._values.get(key, (0, 0.0))
+            self._values[key] = (count + 1, duration + max(0.0, duration_seconds))
+
+    def render(self) -> bytes:
+        with self._lock:
+            values = sorted(self._values.items())
+        lines = [
+            "# HELP ledger_audit_http_requests_total HTTP requests completed by bounded route.",
+            "# TYPE ledger_audit_http_requests_total counter",
+        ]
+        for (method, route, status), (count, _) in values:
+            labels = f'method="{method}",route="{route}",status="{status}"'
+            lines.append(f"ledger_audit_http_requests_total{{{labels}}} {count}")
+        lines.extend(
+            [
+                "# HELP ledger_audit_http_request_duration_seconds Request duration by bounded route.",
+                "# TYPE ledger_audit_http_request_duration_seconds summary",
+            ]
+        )
+        for (method, route, status), (count, duration) in values:
+            labels = f'method="{method}",route="{route}",status="{status}"'
+            lines.append(
+                f"ledger_audit_http_request_duration_seconds_sum{{{labels}}} {duration:.6f}"
+            )
+            lines.append(
+                f"ledger_audit_http_request_duration_seconds_count{{{labels}}} {count}"
+            )
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def _route(path: str) -> str:
-    if path in {"/health", "/ready", "/transactions", "/holds"}:
+    if path in {"/health", "/ready", "/metrics", "/transactions", "/holds"}:
         return path
     if path.startswith("/transactions/") and "/" not in path.removeprefix(
         "/transactions/"
@@ -130,6 +170,19 @@ def _json_response(
             ("Cache-Control", "no-store"),
         ]
         + (extra_headers or []),
+    )
+    return [body]
+
+
+def _metrics_response(start_response: StartResponse, metrics: _RequestMetrics) -> list[bytes]:
+    body = metrics.render()
+    start_response(
+        "200 OK",
+        [
+            ("Content-Type", "text/plain; version=0.0.4; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+            ("Cache-Control", "no-store"),
+        ],
     )
     return [body]
 
@@ -187,6 +240,7 @@ def create_app(
     access_logger: AccessLogger | None = None,
     request_id_factory: Callable[[], str] | None = None,
     readiness: Callable[[], bool] | None = None,
+    metrics_clock: Callable[[], float] | None = None,
 ) -> Callable[[dict[str, Any], StartResponse], Iterable[bytes]]:
     """Create a read-only WSGI app with auth, rate limits, and access records."""
 
@@ -201,6 +255,8 @@ def create_app(
 
     make_request_id = request_id_factory or (lambda: secrets.token_hex(16))
     is_ready = readiness or (lambda: True)
+    monotonic = metrics_clock or time.monotonic
+    metrics = _RequestMetrics()
     rate_limiter = _FixedWindowRateLimiter(
         audit_rate_limit,
         rate_window_seconds,
@@ -211,7 +267,7 @@ def create_app(
         environ: dict[str, Any], start_response: StartResponse
     ) -> Iterable[bytes]:
         path = environ.get("PATH_INFO", "")
-        if path not in {"/health", "/ready"}:
+        if path not in {"/health", "/ready", "/metrics"}:
             allowed, retry_after = rate_limiter.allow()
             if not allowed:
                 return _json_response(
@@ -221,7 +277,7 @@ def create_app(
                     [("Retry-After", str(retry_after))],
                 )
 
-        if path not in {"/health", "/ready"} and api_token is not None:
+        if path not in {"/health", "/ready", "/metrics"} and api_token is not None:
             expected = f"Bearer {api_token}"
             supplied = environ.get("HTTP_AUTHORIZATION", "")
             if (
@@ -258,6 +314,11 @@ def create_app(
                     "503 Service Unavailable",
                     {"status": "unavailable"},
                 )
+
+            if path == "/metrics":
+                if environ.get("QUERY_STRING"):
+                    raise ValueError("metrics endpoint does not accept query parameters")
+                return _metrics_response(start_response, metrics)
 
             if path == "/transactions":
                 query = _query(environ, {"limit", "after", "account"})
@@ -330,6 +391,7 @@ def create_app(
 
     def app(environ: dict[str, Any], start_response: StartResponse) -> Iterable[bytes]:
         request_id = _request_id(make_request_id())
+        started = monotonic()
         status_code = 500
 
         def correlated_start_response(
@@ -345,8 +407,15 @@ def create_app(
         try:
             return dispatch(environ, correlated_start_response)
         finally:
+            method = environ.get("REQUEST_METHOD")
+            metric_method = method if method in {"GET", "POST"} else "OTHER"
+            metrics.observe(
+                metric_method,
+                _route(environ.get("PATH_INFO", "")),
+                status_code,
+                monotonic() - started,
+            )
             if access_logger is not None:
-                method = environ.get("REQUEST_METHOD")
                 access_logger(
                     {
                         "event": "audit_http_access",
