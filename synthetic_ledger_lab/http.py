@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -384,6 +385,12 @@ def create_app(
                 return _json_response(start_response, "200 OK", _hold_payload(hold))
 
             return _json_response(start_response, "404 Not Found", {"error": "not found"})
+        except sqlite3.Error:
+            return _json_response(
+                start_response,
+                "503 Service Unavailable",
+                {"error": "ledger temporarily unavailable"},
+            )
         except ValueError as error:
             return _json_response(
                 start_response, "400 Bad Request", {"error": str(error)}
