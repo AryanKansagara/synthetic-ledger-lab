@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -101,6 +102,31 @@ class AuditHttpTests(unittest.TestCase):
             ("503 Service Unavailable", {"status": "unavailable"}),
         )
         self.assertEqual(self.request("/health")[0], "200 OK")
+
+    def test_readiness_checks_existing_database_and_required_schema_without_creating(self):
+        database_path = self.ledger.path
+        database_path.unlink()
+
+        status, _, payload = self.request("/ready")
+
+        self.assertEqual(
+            (status, payload),
+            ("503 Service Unavailable", {"status": "unavailable"}),
+        )
+        self.assertFalse(database_path.exists())
+        self.assertEqual(self.request("/health")[0], "200 OK")
+
+    def test_readiness_sanitizes_corrupt_and_incomplete_databases(self):
+        database_path = self.ledger.path
+        database_path.write_bytes(b"not a sqlite database /private/ledger.sqlite3")
+        self.assertEqual(self.request("/ready")[0], "503 Service Unavailable")
+
+        database_path.unlink()
+        with closing(sqlite3.connect(database_path)) as database, database:
+            database.execute("CREATE TABLE transactions (tx_id TEXT PRIMARY KEY)")
+        status, _, payload = self.request("/ready")
+        self.assertEqual(status, "503 Service Unavailable")
+        self.assertEqual(payload, {"status": "unavailable"})
 
     def test_shutdown_handler_is_idempotent_and_runs_shutdown_off_signal_thread(self):
         state = _ShutdownState()

@@ -20,6 +20,9 @@ from synthetic_ledger_lab.ledger import Ledger
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 AccessLogger = Callable[[dict[str, Any]], None]
+_REQUIRED_LEDGER_TABLES = frozenset(
+    {"transactions", "postings", "account_policies", "account_holds"}
+)
 
 
 class _ShutdownState:
@@ -50,6 +53,27 @@ def _shutdown_handler(
         state.begin(shutdown)
 
     return handle_signal
+
+
+def _ledger_ready(ledger: Ledger) -> bool:
+    """Check that the existing SQLite ledger is readable and has its core schema."""
+
+    database_uri = ledger.path.resolve().as_uri() + "?mode=ro"
+    try:
+        database = sqlite3.connect(database_uri, uri=True, timeout=1.0)
+        try:
+            integrity = database.execute("PRAGMA quick_check").fetchone()
+            tables = {
+                name
+                for (name,) in database.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            return integrity == ("ok",) and _REQUIRED_LEDGER_TABLES <= tables
+        finally:
+            database.close()
+    except (OSError, sqlite3.Error):
+        return False
 
 
 class _FixedWindowRateLimiter:
@@ -308,7 +332,7 @@ def create_app(
             if path == "/ready":
                 if environ.get("QUERY_STRING"):
                     raise ValueError("readiness endpoint does not accept query parameters")
-                if is_ready():
+                if is_ready() and _ledger_ready(ledger):
                     return _json_response(start_response, "200 OK", {"status": "ready"})
                 return _json_response(
                     start_response,
