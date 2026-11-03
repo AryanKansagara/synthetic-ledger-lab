@@ -174,6 +174,9 @@ the core's 1–100 item keyset
 pagination and filters. Unknown, duplicate, blank, or malformed parameters are
 rejected; non-`GET` methods cannot mutate the ledger. Responses are marked
 `Cache-Control: no-store` and carry an application-generated `X-Request-ID`.
+SQLite failures on transaction and hold reads return a correlated generic `503`
+without exposing database paths or driver details. The local adapter does not
+retry failed reads or provide production connection pooling.
 The CLI emits one structured JSON access record per request to stderr. Records
 use bounded route templates, method classes and status codes; they deliberately
 omit query strings, resource IDs, headers, bearer credentials and response

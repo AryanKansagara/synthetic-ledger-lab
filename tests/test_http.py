@@ -1,10 +1,12 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 from wsgiref.util import setup_testing_defaults
 
 from synthetic_ledger_lab.http import _ShutdownState, _shutdown_handler, create_app
@@ -412,6 +414,32 @@ class AuditHttpTests(unittest.TestCase):
                 status, _, payload = self.request(path)
                 self.assertEqual(status, "404 Not Found")
                 self.assertEqual(payload, {"error": "not found"})
+
+    def test_database_failures_are_sanitized_and_correlated(self):
+        records: list[dict[str, Any]] = []
+        self.app = create_app(
+            self.ledger,
+            access_logger=records.append,
+            request_id_factory=lambda: "request-db-failure",
+        )
+        detail = "unable to open database file: /private/ledger.sqlite3"
+
+        cases = [
+            ("/transactions", "transactions"),
+            ("/transactions/fund", "transaction"),
+            ("/holds", "holds"),
+            ("/holds/hold-active", "hold"),
+        ]
+        for path, method in cases:
+            with self.subTest(path=path), patch.object(
+                self.ledger, method, side_effect=sqlite3.OperationalError(detail)
+            ):
+                status, headers, payload = self.request(path)
+                self.assertEqual(status, "503 Service Unavailable")
+                self.assertEqual(payload, {"error": "ledger temporarily unavailable"})
+                self.assertEqual(headers["X-Request-ID"], "request-db-failure")
+                self.assertNotIn(detail, json.dumps(payload))
+                self.assertEqual(records[-1]["status"], 503)
 
 
 if __name__ == "__main__":
