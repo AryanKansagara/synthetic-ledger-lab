@@ -33,6 +33,7 @@ class LedgerTests(unittest.TestCase):
             tracked = mock.MagicMock(wraps=connection)
             tracked.__enter__.return_value = connection
             tracked.__exit__.side_effect = connection.__exit__
+            tracked.close.side_effect = connection.close
             return tracked
 
         successful = tracked_connection()

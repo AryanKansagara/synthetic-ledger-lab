@@ -205,10 +205,15 @@ local scraper can observe saturation; protect it at the network boundary in a
 real deployment. Duration summaries provide counts and sums, not quantiles or
 histograms, and a scrape reports completed requests before that scrape.
 
-`/health` reports process liveness. Public `/ready` reports whether the demo is
-still accepting traffic. On `SIGTERM` or `SIGINT`, the CLI first changes
-readiness to `503`, then asks the standard-library server to stop from a separate
-thread so `serve_forever()` cannot deadlock in its signal handler. Repeated
+`/health` reports process liveness. Public `/ready` opens the existing SQLite
+file read-only, runs SQLite's quick integrity check, verifies the core ledger
+tables, and reports whether the demo is still accepting traffic. A missing,
+unreadable, corrupt, or incomplete ledger returns a generic `503` without
+creating a database or exposing its path. This probe is intentionally a local
+SQLite check, not a downstream dependency graph. On `SIGTERM` or `SIGINT`, the
+CLI first changes readiness to `503`, then asks the standard-library server to
+stop from a separate thread so `serve_forever()` cannot deadlock in its signal
+handler. Repeated
 signals are idempotent. This is lifecycle signaling for a local single-process
 demo, not production connection draining: a supervisor or load balancer must
 stop routing traffic after readiness withdrawal and allow in-flight requests to
