@@ -140,10 +140,26 @@ offsets, so concurrent inserts before a cursor do not shift later pages. A
 multi-page traversal is not a frozen snapshot: transactions committed between
 requests can appear on a later page when their ID sorts after the cursor.
 
+Account-focused audit consumers can request posting-level statement pages with
+running balances. Entries and cursors use transaction-ID order (not event-time
+order, because this narrow ledger does not persist timestamps), and balances are
+summed in Python so they remain readable beyond SQLite's signed-integer aggregate
+range:
+
+```python
+page = ledger.account_statement("demo-wallet", limit=50)
+for entry in page.entries:
+    print(entry.transaction_id, entry.amount, entry.balance_after)
+```
+
+Each page's opening balance and entries come from one SQLite read snapshot. A
+multi-page traversal is not frozen across calls, so concurrent transaction IDs
+inserted after the cursor can appear on a later page.
+
 ## Local read-only audit API
 
-A dependency-free WSGI adapter exposes the transaction and hold audit queries as
-strict JSON `GET` endpoints for a local demo:
+A dependency-free WSGI adapter exposes transaction, account-statement, and hold
+audit queries as strict JSON `GET` endpoints for a local demo:
 
 ```bash
 python3 -m synthetic_ledger_lab.http demo.sqlite3 --host 127.0.0.1 --port 8080
@@ -169,8 +185,9 @@ non-health request, including failed authentication attempts. The default is
 `/health` remains available for liveness checks.
 
 Available routes are `/health`, `/ready`, `/metrics`, `/transactions`,
-`/transactions/{id}`, `/holds`, and `/holds/{id}`. Collection routes preserve
-the core's 1–100 item keyset
+`/transactions/{id}`, `/account-statement`, `/holds`, and `/holds/{id}`. The
+statement route requires an `account` query parameter and returns bounded entries
+with running balances. Collection routes preserve the core's 1–100 item keyset
 pagination and filters. Unknown, duplicate, blank, or malformed parameters are
 rejected; non-`GET` methods cannot mutate the ledger. Responses are marked
 `Cache-Control: no-store` and carry an application-generated `X-Request-ID`.

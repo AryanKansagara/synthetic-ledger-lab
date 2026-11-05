@@ -72,6 +72,23 @@ class TransactionPage:
 
 
 @dataclass(frozen=True)
+class AccountEntry:
+    """One posting and its account balance in transaction-ID order."""
+
+    transaction_id: str
+    amount: int
+    balance_after: int
+
+
+@dataclass(frozen=True)
+class AccountStatementPage:
+    """A keyset-paginated page of entries for one synthetic account."""
+
+    entries: tuple[AccountEntry, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
 class AccountHold:
     """One durable synthetic balance reservation."""
 
@@ -686,6 +703,55 @@ class Ledger:
         return TransactionPage(
             transactions=transactions,
             next_cursor=page_ids[-1] if len(transaction_ids) > limit else None,
+        )
+
+    def account_statement(
+        self,
+        account: str,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> AccountStatementPage:
+        """Return account postings with running balances in transaction-ID order.
+
+        ``after`` is the last transaction ID from a prior page. Running balances
+        are calculated in Python so a valid account history can exceed SQLite's
+        signed-integer aggregate range. Both the opening balance and page are read
+        from one SQLite snapshot.
+        """
+        self._validate_account(account)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        if after is not None and (not isinstance(after, str) or not after.strip()):
+            raise ValueError("after must be a non-empty string or None")
+
+        with _connect(self.path) as db:
+            db.execute("BEGIN")
+            opening_balance = 0
+            if after is not None:
+                opening_balance = sum(
+                    amount
+                    for (amount,) in db.execute(
+                        """SELECT amount FROM postings
+                           WHERE account = ? AND tx_id <= ? ORDER BY tx_id""",
+                        (account, after),
+                    )
+                )
+            rows = db.execute(
+                """SELECT tx_id, amount FROM postings
+                   WHERE account = ? AND (? IS NULL OR tx_id > ?)
+                   ORDER BY tx_id LIMIT ?""",
+                (account, after, after, limit + 1),
+            ).fetchall()
+
+        balance = opening_balance
+        entries: list[AccountEntry] = []
+        for transaction_id, amount in rows[:limit]:
+            balance += amount
+            entries.append(AccountEntry(transaction_id, amount, balance))
+        return AccountStatementPage(
+            entries=tuple(entries),
+            next_cursor=entries[-1].transaction_id if len(rows) > limit else None,
         )
 
     def export_reconciliation_csv(
