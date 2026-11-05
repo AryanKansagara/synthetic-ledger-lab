@@ -154,7 +154,10 @@ for entry in page.entries:
 
 Each page's opening balance and entries come from one SQLite read snapshot. A
 multi-page traversal is not frozen across calls, so concurrent transaction IDs
-inserted after the cursor can appear on a later page.
+inserted after the cursor can appear on a later page. A composite
+`(account, tx_id)` index keeps account filtering, cursor advancement, and
+transaction-ID ordering on one SQLite index scan; statement generation still
+reads every earlier posting needed to calculate the exact opening balance.
 
 ## Local read-only audit API
 

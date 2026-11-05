@@ -173,7 +173,14 @@ class Ledger:
                 db.execute("ALTER TABLE account_holds ADD COLUMN expires_at INTEGER")
             if "expired_at" not in hold_columns:
                 db.execute("ALTER TABLE account_holds ADD COLUMN expired_at INTEGER")
-            db.execute("CREATE INDEX IF NOT EXISTS postings_account ON postings(account)")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS postings_account_tx "
+                "ON postings(account, tx_id)"
+            )
+            # The composite index covers account-only balance reads as well as
+            # transaction-ID keyset scans, so retaining the older prefix index
+            # would add write and storage cost without serving another query.
+            db.execute("DROP INDEX IF EXISTS postings_account")
             db.execute(
                 "CREATE INDEX IF NOT EXISTS active_holds_account "
                 "ON account_holds(account, active)"
@@ -737,11 +744,17 @@ class Ledger:
                         (account, after),
                     )
                 )
+            page_after = " AND tx_id > ?" if after is not None else ""
+            parameters: tuple[str | int, ...] = (
+                (account, after, limit + 1)
+                if after is not None
+                else (account, limit + 1)
+            )
             rows = db.execute(
-                """SELECT tx_id, amount FROM postings
-                   WHERE account = ? AND (? IS NULL OR tx_id > ?)
-                   ORDER BY tx_id LIMIT ?""",
-                (account, after, after, limit + 1),
+                f"""SELECT tx_id, amount FROM postings
+                    WHERE account = ?{page_after}
+                    ORDER BY tx_id LIMIT ?""",
+                parameters,
             ).fetchall()
 
         balance = opening_balance
