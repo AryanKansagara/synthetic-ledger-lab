@@ -154,7 +154,14 @@ class _RequestMetrics:
 
 
 def _route(path: str) -> str:
-    if path in {"/health", "/ready", "/metrics", "/transactions", "/holds"}:
+    if path in {
+        "/health",
+        "/ready",
+        "/metrics",
+        "/transactions",
+        "/holds",
+        "/account-statement",
+    }:
         return path
     if path.startswith("/transactions/") and "/" not in path.removeprefix(
         "/transactions/"
@@ -357,6 +364,25 @@ def create_app(
                     "200 OK",
                     {
                         "transactions": [asdict(item) for item in page.transactions],
+                        "next_cursor": page.next_cursor,
+                    },
+                )
+
+            if path == "/account-statement":
+                query = _query(environ, {"account", "limit", "after"})
+                if "account" not in query:
+                    raise ValueError("account is required")
+                page = ledger.account_statement(
+                    query["account"],
+                    limit=_limit(query.get("limit")),
+                    after=query.get("after"),
+                )
+                return _json_response(
+                    start_response,
+                    "200 OK",
+                    {
+                        "account": query["account"],
+                        "entries": [asdict(item) for item in page.entries],
                         "next_cursor": page.next_cursor,
                     },
                 )

@@ -545,6 +545,47 @@ class LedgerTests(unittest.TestCase):
             self.ledger.post("tx-1", [("wallet", -10), ("merchant", 10)])
         )
 
+    def test_account_statement_pages_include_overflow_safe_running_balances(self):
+        maximum = 2**63 - 1
+        self.ledger.post("tx-c", [("clearing-c", -5), ("wallet", 5)])
+        self.ledger.post("tx-a", [("clearing-a", -maximum), ("wallet", maximum)])
+        self.ledger.post("tx-b", [("clearing-b", -maximum), ("wallet", maximum)])
+
+        first = self.ledger.account_statement("wallet", limit=2)
+        second = self.ledger.account_statement(
+            "wallet", limit=2, after=first.next_cursor
+        )
+
+        self.assertEqual(
+            [
+                (entry.transaction_id, entry.amount, entry.balance_after)
+                for entry in first.entries
+            ],
+            [
+                ("tx-a", maximum, maximum),
+                ("tx-b", maximum, 2 * maximum),
+            ],
+        )
+        self.assertEqual(first.next_cursor, "tx-b")
+        self.assertEqual(
+            [(entry.transaction_id, entry.balance_after) for entry in second.entries],
+            [("tx-c", 2 * maximum + 5)],
+        )
+        self.assertIsNone(second.next_cursor)
+
+    def test_account_statement_validates_queries_and_handles_empty_accounts(self):
+        self.assertEqual(self.ledger.account_statement("missing").entries, ())
+        for arguments in (
+            {"account": ""},
+            {"account": "wallet", "limit": True},
+            {"account": "wallet", "limit": 0},
+            {"account": "wallet", "limit": 101},
+            {"account": "wallet", "after": ""},
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    self.ledger.account_statement(**arguments)  # type: ignore[arg-type]
+
     def test_reconciliation_export_is_deterministic_and_checksummed(self):
         self.ledger.post("tx-z", [("wallet", -250), ("merchant", 250)])
         self.ledger.post("tx-a", [("clearing", -1000), ("wallet", 1000)])

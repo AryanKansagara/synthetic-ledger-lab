@@ -416,6 +416,28 @@ class AuditHttpTests(unittest.TestCase):
         self.assertEqual(status, "404 Not Found")
         self.assertEqual(payload, {"error": "hold not found"})
 
+    def test_account_statement_exposes_bounded_running_balance_pages(self):
+        self.ledger.post("purchase", [("merchant", 250), ("wallet", -250)])
+
+        status, _, payload = self.request(
+            "/account-statement", query="account=wallet&limit=1"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload["account"], "wallet")
+        self.assertEqual(
+            payload["entries"],
+            [{"amount": 1000, "balance_after": 1000, "transaction_id": "fund"}],
+        )
+        self.assertEqual(payload["next_cursor"], "fund")
+
+        status, _, payload = self.request(
+            "/account-statement", query="account=wallet&after=fund&limit=1"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload["entries"][0]["transaction_id"], "purchase")
+        self.assertEqual(payload["entries"][0]["balance_after"], 750)
+        self.assertIsNone(payload["next_cursor"])
+
     def test_query_validation_is_strict_and_bounded(self):
         cases = [
             ("/transactions", "limit=0", "limit must be"),
@@ -423,6 +445,8 @@ class AuditHttpTests(unittest.TestCase):
             ("/transactions", "limit=1&limit=2", "must appear once"),
             ("/transactions", "unknown=value", "unsupported query parameter"),
             ("/transactions", "account=", "account must be"),
+            ("/account-statement", "limit=1", "account is required"),
+            ("/account-statement", "account=", "account must be"),
             ("/holds", "state=pending", "state must be"),
             ("/holds", "badfield", "malformed query string"),
             ("/health", "check=true", "does not accept"),
@@ -453,6 +477,7 @@ class AuditHttpTests(unittest.TestCase):
         cases = [
             ("/transactions", "transactions"),
             ("/transactions/fund", "transaction"),
+            ("/account-statement", "account_statement"),
             ("/holds", "holds"),
             ("/holds/hold-active", "hold"),
         ]
@@ -460,7 +485,8 @@ class AuditHttpTests(unittest.TestCase):
             with self.subTest(path=path), patch.object(
                 self.ledger, method, side_effect=sqlite3.OperationalError(detail)
             ):
-                status, headers, payload = self.request(path)
+                query = "account=wallet" if path == "/account-statement" else ""
+                status, headers, payload = self.request(path, query=query)
                 self.assertEqual(status, "503 Service Unavailable")
                 self.assertEqual(payload, {"error": "ledger temporarily unavailable"})
                 self.assertEqual(headers["X-Request-ID"], "request-db-failure")
