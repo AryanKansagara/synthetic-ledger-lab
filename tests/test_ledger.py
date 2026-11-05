@@ -586,6 +586,38 @@ class LedgerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.ledger.account_statement(**arguments)  # type: ignore[arg-type]
 
+    def test_account_statement_index_supports_ordered_keyset_scan(self):
+        # Reopening an existing ledger upgrades the former account-only index.
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE INDEX postings_account ON postings(account)")
+        self.ledger = Ledger(self.path)
+        self.ledger.post("tx-a", [("clearing", -1), ("wallet", 1)])
+        self.ledger.post("tx-b", [("wallet", -1), ("merchant", 1)])
+
+        with closing(sqlite3.connect(self.path)) as db:
+            index_columns = [
+                row[2] for row in db.execute("PRAGMA index_info(postings_account_tx)")
+            ]
+            old_index = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                ("postings_account",),
+            ).fetchone()
+            plan = " ".join(
+                row[3]
+                for row in db.execute(
+                    """EXPLAIN QUERY PLAN
+                       SELECT tx_id, amount FROM postings
+                       WHERE account = ? AND tx_id > ?
+                       ORDER BY tx_id LIMIT ?""",
+                    ("wallet", "tx-a", 51),
+                )
+            )
+
+        self.assertEqual(index_columns, ["account", "tx_id"])
+        self.assertIsNone(old_index)
+        self.assertIn("postings_account_tx", plan)
+        self.assertNotIn("TEMP B-TREE", plan.upper())
+
     def test_reconciliation_export_is_deterministic_and_checksummed(self):
         self.ledger.post("tx-z", [("wallet", -250), ("merchant", 250)])
         self.ledger.post("tx-a", [("clearing", -1000), ("wallet", 1000)])
