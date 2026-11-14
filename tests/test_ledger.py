@@ -87,6 +87,37 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.balance("wallet"), 2 * maximum)
         self.assertEqual(self.ledger.balance("missing"), 0)
 
+    def test_account_position_is_consistent_and_expires_due_holds(self):
+        now = 100
+
+        ledger = Ledger(self.path, clock=lambda: now)
+        ledger.post("fund-position", [("clearing", -1000), ("wallet", 1000)])
+        ledger.set_minimum_balance("wallet", -50)
+        ledger.place_hold("active-position", "wallet", 200, expires_at=200)
+        ledger.place_hold("due-position", "wallet", 300, expires_at=101)
+
+        now = 101
+        position = ledger.account_position("wallet")
+
+        self.assertEqual(position.account, "wallet")
+        self.assertEqual(position.posted_balance, 1000)
+        self.assertEqual(position.active_hold_amount, 200)
+        self.assertEqual(position.available_balance, 800)
+        self.assertEqual(position.minimum_balance, -50)
+        self.assertEqual(ledger.hold("due-position").expired_at, 101)
+
+        missing = ledger.account_position("missing")
+        self.assertEqual(missing.posted_balance, 0)
+        self.assertEqual(missing.active_hold_amount, 0)
+        self.assertEqual(missing.available_balance, 0)
+        self.assertIsNone(missing.minimum_balance)
+
+    def test_account_position_rejects_invalid_account(self):
+        for account in ("", "   ", None):
+            with self.subTest(account=account):
+                with self.assertRaisesRegex(ValueError, "account must be"):
+                    self.ledger.account_position(account)  # type: ignore[arg-type]
+
     def test_minimum_balance_blocks_overdraft_without_mutation(self):
         self.ledger.post("fund", [("clearing", -1000), ("wallet", 1000)])
         self.ledger.set_minimum_balance("wallet", 0)
