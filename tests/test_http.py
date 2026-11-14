@@ -438,6 +438,34 @@ class AuditHttpTests(unittest.TestCase):
         self.assertEqual(payload["entries"][0]["balance_after"], 750)
         self.assertIsNone(payload["next_cursor"])
 
+    def test_account_position_exposes_one_consistent_snapshot(self):
+        status, _, payload = self.request(
+            "/account-position", query="account=wallet"
+        )
+
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            payload,
+            {
+                "account": "wallet",
+                "active_hold_amount": 100,
+                "available_balance": 900,
+                "minimum_balance": 0,
+                "posted_balance": 1000,
+            },
+        )
+
+        cases = (
+            "",
+            "account=",
+            "account=wallet&extra=value",
+            "account=a&account=b",
+        )
+        for query in cases:
+            with self.subTest(query=query):
+                status, _, _ = self.request("/account-position", query=query)
+                self.assertEqual(status, "400 Bad Request")
+
     def test_query_validation_is_strict_and_bounded(self):
         cases = [
             ("/transactions", "limit=0", "limit must be"),

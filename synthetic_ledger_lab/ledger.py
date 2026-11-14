@@ -89,6 +89,17 @@ class AccountStatementPage:
 
 
 @dataclass(frozen=True)
+class AccountPosition:
+    """One internally consistent account balance and reservation snapshot."""
+
+    account: str
+    posted_balance: int
+    active_hold_amount: int
+    available_balance: int
+    minimum_balance: int | None
+
+
+@dataclass(frozen=True)
 class AccountHold:
     """One durable synthetic balance reservation."""
 
@@ -553,6 +564,32 @@ class Ledger:
             return self._balance_in_connection(
                 db, account
             ) - self._active_holds_in_connection(db, account)
+
+    def account_position(self, account: str) -> AccountPosition:
+        """Return posted, reserved, available, and policy amounts atomically.
+
+        Due holds are durably expired before the values are read. All returned
+        fields come from the same serialized SQLite transaction, avoiding the
+        inconsistent combinations that separate balance and hold reads could
+        observe while another writer posts or changes a hold.
+        """
+        self._validate_account(account)
+        with _connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now(), account)
+            posted_balance = self._balance_in_connection(db, account)
+            active_hold_amount = self._active_holds_in_connection(db, account)
+            policy = db.execute(
+                "SELECT minimum_balance FROM account_policies WHERE account = ?",
+                (account,),
+            ).fetchone()
+            return AccountPosition(
+                account=account,
+                posted_balance=posted_balance,
+                active_hold_amount=active_hold_amount,
+                available_balance=posted_balance - active_hold_amount,
+                minimum_balance=None if policy is None else policy[0],
+            )
 
     def post(self, tx_id: str, entries: list[tuple[str, int]]) -> bool:
         """Post a zero-sum batch in integer minor units; False on exact replay."""

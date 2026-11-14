@@ -159,10 +159,18 @@ inserted after the cursor can appear on a later page. A composite
 transaction-ID ordering on one SQLite index scan; statement generation still
 reads every earlier posting needed to calculate the exact opening balance.
 
+For a point-in-time operational view, `ledger.account_position("demo-wallet")`
+returns the posted balance, total active holds, available balance, and optional
+minimum-balance policy from one serialized SQLite transaction. It first durably
+expires due holds, so the fields cannot mix values observed on opposite sides of
+a concurrent posting or hold transition. This is a synthetic ledger snapshot,
+not a bank balance, authorization result, or statement of real funds.
+
 ## Local read-only audit API
 
-A dependency-free WSGI adapter exposes transaction, account-statement, and hold
-audit queries as strict JSON `GET` endpoints for a local demo:
+A dependency-free WSGI adapter exposes transaction, account-statement,
+account-position, and hold audit queries as strict JSON `GET` endpoints for a
+local demo:
 
 ```bash
 python3 -m synthetic_ledger_lab.http demo.sqlite3 --host 127.0.0.1 --port 8080
@@ -188,15 +196,17 @@ non-health request, including failed authentication attempts. The default is
 `/health` remains available for liveness checks.
 
 Available routes are `/health`, `/ready`, `/metrics`, `/transactions`,
-`/transactions/{id}`, `/account-statement`, `/holds`, and `/holds/{id}`. The
-statement route requires an `account` query parameter and returns bounded entries
-with running balances. Collection routes preserve the core's 1–100 item keyset
-pagination and filters. Unknown, duplicate, blank, or malformed parameters are
+`/transactions/{id}`, `/account-statement`, `/account-position`, `/holds`, and
+`/holds/{id}`. The account-position route requires an `account` query parameter
+and returns one atomic posted/held/available/policy snapshot. The statement route
+requires an `account` query parameter and returns bounded entries with running
+balances. Collection routes preserve the core's 1–100 item keyset pagination and
+filters. Unknown, duplicate, blank, or malformed parameters are
 rejected; non-`GET` methods cannot mutate the ledger. Responses are marked
 `Cache-Control: no-store` and carry an application-generated `X-Request-ID`.
-SQLite failures on transaction and hold reads return a correlated generic `503`
-without exposing database paths or driver details. The local adapter does not
-retry failed reads or provide production connection pooling.
+SQLite failures on transaction, account, and hold reads return a correlated
+generic `503` without exposing database paths or driver details. The local
+adapter does not retry failed reads or provide production connection pooling.
 The CLI emits one structured JSON access record per request to stderr. Records
 use bounded route templates, method classes and status codes; they deliberately
 omit query strings, resource IDs, headers, bearer credentials and response

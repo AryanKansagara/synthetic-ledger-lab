@@ -161,6 +161,7 @@ def _route(path: str) -> str:
         "/transactions",
         "/holds",
         "/account-statement",
+        "/account-position",
     }:
         return path
     if path.startswith("/transactions/") and "/" not in path.removeprefix(
@@ -385,6 +386,16 @@ def create_app(
                         "entries": [asdict(item) for item in page.entries],
                         "next_cursor": page.next_cursor,
                     },
+                )
+
+            if path == "/account-position":
+                query = _query(environ, {"account"})
+                if "account" not in query:
+                    raise ValueError("account is required")
+                return _json_response(
+                    start_response,
+                    "200 OK",
+                    asdict(ledger.account_position(query["account"])),
                 )
 
             if path.startswith("/transactions/"):
