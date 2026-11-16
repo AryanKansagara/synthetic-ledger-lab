@@ -466,6 +466,37 @@ class AuditHttpTests(unittest.TestCase):
                 status, _, _ = self.request("/account-position", query=query)
                 self.assertEqual(status, "400 Bad Request")
 
+    def test_account_positions_expose_bounded_keyset_pages(self):
+        status, _, first = self.request("/account-positions", query="limit=1")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(first["positions"][0]["account"], "clearing")
+        self.assertEqual(first["next_cursor"], "clearing")
+
+        status, _, second = self.request(
+            "/account-positions", query="limit=1&after=clearing"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            second["positions"],
+            [
+                {
+                    "account": "wallet",
+                    "posted_balance": 1000,
+                    "active_hold_amount": 100,
+                    "available_balance": 900,
+                    "minimum_balance": 0,
+                }
+            ],
+        )
+        self.assertIsNone(second["next_cursor"])
+
+        for query in ("limit=0", "after=", "account=wallet", "limit=1&limit=2"):
+            with self.subTest(query=query):
+                self.assertEqual(
+                    self.request("/account-positions", query=query)[0],
+                    "400 Bad Request",
+                )
+
     def test_query_validation_is_strict_and_bounded(self):
         cases = [
             ("/transactions", "limit=0", "limit must be"),

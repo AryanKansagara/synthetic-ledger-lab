@@ -166,6 +166,14 @@ expires due holds, so the fields cannot mix values observed on opposite sides of
 a concurrent posting or hold transition. This is a synthetic ledger snapshot,
 not a bank balance, authorization result, or statement of real funds.
 
+Operational dashboards can traverse all known accounts in lexical account order
+with `ledger.account_positions(limit=50, after=cursor)`. Each page is built from
+one serialized SQLite snapshot after due holds are expired, and includes accounts
+known only through historical holds or a minimum-balance policy. Cursors are
+account names. A multi-page traversal is not frozen across calls, so concurrent
+account creation can affect later pages; balances remain overflow-safe Python
+integers.
+
 ## Local read-only audit API
 
 A dependency-free WSGI adapter exposes transaction, account-statement,
@@ -196,9 +204,12 @@ non-health request, including failed authentication attempts. The default is
 `/health` remains available for liveness checks.
 
 Available routes are `/health`, `/ready`, `/metrics`, `/transactions`,
-`/transactions/{id}`, `/account-statement`, `/account-position`, `/holds`, and
+`/transactions/{id}`, `/account-statement`, `/account-position`,
+`/account-positions`, `/holds`, and
 `/holds/{id}`. The account-position route requires an `account` query parameter
-and returns one atomic posted/held/available/policy snapshot. The statement route
+and returns one atomic posted/held/available/policy snapshot. The account-positions
+route returns bounded account-name keyset pages from one snapshot per request. The
+statement route
 requires an `account` query parameter and returns bounded entries with running
 balances. Collection routes preserve the core's 1–100 item keyset pagination and
 filters. Unknown, duplicate, blank, or malformed parameters are

@@ -162,6 +162,7 @@ def _route(path: str) -> str:
         "/holds",
         "/account-statement",
         "/account-position",
+        "/account-positions",
     }:
         return path
     if path.startswith("/transactions/") and "/" not in path.removeprefix(
@@ -396,6 +397,20 @@ def create_app(
                     start_response,
                     "200 OK",
                     asdict(ledger.account_position(query["account"])),
+                )
+
+            if path == "/account-positions":
+                query = _query(environ, {"limit", "after"})
+                page = ledger.account_positions(
+                    limit=_limit(query.get("limit")), after=query.get("after")
+                )
+                return _json_response(
+                    start_response,
+                    "200 OK",
+                    {
+                        "positions": [asdict(item) for item in page.positions],
+                        "next_cursor": page.next_cursor,
+                    },
                 )
 
             if path.startswith("/transactions/"):

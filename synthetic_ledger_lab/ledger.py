@@ -100,6 +100,14 @@ class AccountPosition:
 
 
 @dataclass(frozen=True)
+class AccountPositionPage:
+    """A keyset-paginated page of internally consistent account positions."""
+
+    positions: tuple[AccountPosition, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
 class AccountHold:
     """One durable synthetic balance reservation."""
 
@@ -590,6 +598,65 @@ class Ledger:
                 available_balance=posted_balance - active_hold_amount,
                 minimum_balance=None if policy is None else policy[0],
             )
+
+    def account_positions(
+        self, *, limit: int = 50, after: str | None = None
+    ) -> AccountPositionPage:
+        """Return an account-ordered page from one serialized ledger snapshot.
+
+        The account registry is the union of postings, holds, and minimum-balance
+        policies. Due holds are durably expired before any page values are read.
+        Amounts are summed in Python to avoid SQLite signed-integer overflow.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        if after is not None:
+            self._validate_account(after)
+
+        with _connect(self.path, timeout=10) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._expire_holds_in_connection(db, self._now())
+            if after is None:
+                where = ""
+                parameters: tuple[str | int, ...] = (limit + 1,)
+            else:
+                where = "WHERE account > ?"
+                parameters = (after, limit + 1)
+            accounts = [
+                account
+                for (account,) in db.execute(
+                    f"""SELECT account FROM (
+                            SELECT account FROM postings
+                            UNION SELECT account FROM account_holds
+                            UNION SELECT account FROM account_policies
+                        ) {where}
+                        ORDER BY account LIMIT ?""",
+                    parameters,
+                )
+            ]
+            page_accounts = accounts[:limit]
+            positions = []
+            for account in page_accounts:
+                posted_balance = self._balance_in_connection(db, account)
+                active_hold_amount = self._active_holds_in_connection(db, account)
+                policy = db.execute(
+                    "SELECT minimum_balance FROM account_policies WHERE account = ?",
+                    (account,),
+                ).fetchone()
+                positions.append(
+                    AccountPosition(
+                        account=account,
+                        posted_balance=posted_balance,
+                        active_hold_amount=active_hold_amount,
+                        available_balance=posted_balance - active_hold_amount,
+                        minimum_balance=None if policy is None else policy[0],
+                    )
+                )
+
+        return AccountPositionPage(
+            positions=tuple(positions),
+            next_cursor=page_accounts[-1] if len(accounts) > limit else None,
+        )
 
     def post(self, tx_id: str, entries: list[tuple[str, int]]) -> bool:
         """Post a zero-sum batch in integer minor units; False on exact replay."""
