@@ -118,6 +118,54 @@ class LedgerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "account must be"):
                     self.ledger.account_position(account)  # type: ignore[arg-type]
 
+    def test_account_position_pages_are_ordered_complete_and_overflow_safe(self):
+        maximum = 2**63 - 1
+        self.ledger.post("fund-a", [("clearing-a", -maximum), ("wallet", maximum)])
+        self.ledger.post("fund-b", [("clearing-b", -maximum), ("wallet", maximum)])
+        self.ledger.set_minimum_balance("policy-only", -10)
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.place_hold("wallet-hold", "wallet", 25)
+
+        first = self.ledger.account_positions(limit=3)
+        second = self.ledger.account_positions(limit=3, after=first.next_cursor)
+        positions = first.positions + second.positions
+
+        self.assertEqual(
+            [position.account for position in positions],
+            ["clearing-a", "clearing-b", "policy-only", "wallet"],
+        )
+        self.assertEqual(first.next_cursor, "policy-only")
+        self.assertIsNone(second.next_cursor)
+        wallet = positions[-1]
+        self.assertEqual(wallet.posted_balance, 2 * maximum)
+        self.assertEqual(wallet.active_hold_amount, 25)
+        self.assertEqual(wallet.available_balance, 2 * maximum - 25)
+        self.assertEqual(wallet.minimum_balance, 0)
+
+    def test_account_position_pages_expire_due_holds_and_validate_queries(self):
+        now = 100
+        ledger = Ledger(self.path, clock=lambda: now)
+        ledger.set_minimum_balance("wallet", -100)
+        ledger.place_hold("due", "wallet", 50, expires_at=101)
+        now = 101
+
+        page = ledger.account_positions()
+
+        self.assertEqual(len(page.positions), 1)
+        self.assertEqual(page.positions[0].active_hold_amount, 0)
+        due = ledger.hold("due")
+        self.assertIsNotNone(due)
+        assert due is not None
+        self.assertEqual(due.expired_at, 101)
+        for limit in (0, 101, True):
+            with self.subTest(limit=limit):
+                with self.assertRaisesRegex(ValueError, "limit must be"):
+                    ledger.account_positions(limit=limit)  # type: ignore[arg-type]
+        for after in ("", "   ", 1):
+            with self.subTest(after=after):
+                with self.assertRaisesRegex(ValueError, "account must be"):
+                    ledger.account_positions(after=after)  # type: ignore[arg-type]
+
     def test_minimum_balance_blocks_overdraft_without_mutation(self):
         self.ledger.post("fund", [("clearing", -1000), ("wallet", 1000)])
         self.ledger.set_minimum_balance("wallet", 0)
