@@ -108,6 +108,21 @@ class AccountPositionPage:
 
 
 @dataclass(frozen=True)
+class LedgerIntegrityReport:
+    """Deterministic structural checks over one read-only ledger snapshot."""
+
+    valid: bool
+    sqlite_integrity_ok: bool
+    transaction_count: int
+    posting_count: int
+    account_count: int
+    orphan_posting_count: int
+    invalid_transaction_count: int
+    malformed_payload_count: int
+    payload_mismatch_count: int
+
+
+@dataclass(frozen=True)
 class AccountHold:
     """One durable synthetic balance reservation."""
 
@@ -656,6 +671,103 @@ class Ledger:
         return AccountPositionPage(
             positions=tuple(positions),
             next_cursor=page_accounts[-1] if len(accounts) > limit else None,
+        )
+
+    @staticmethod
+    def _validated_payload_postings(payload: str) -> tuple[tuple[str, int], ...] | None:
+        """Decode a canonical posting payload, returning ``None`` when malformed."""
+        try:
+            entries = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(entries, list) or len(entries) < 2:
+            return None
+
+        normalized: list[tuple[str, int]] = []
+        for entry in entries:
+            if not isinstance(entry, list) or len(entry) != 2:
+                return None
+            account, amount = entry
+            if (
+                not isinstance(account, str)
+                or not account.strip()
+                or type(amount) is not int
+                or not -(2**63) <= amount < 2**63
+                or amount == 0
+            ):
+                return None
+            normalized.append((account, amount))
+        if len({account for account, _ in normalized}) != len(normalized):
+            return None
+        if sum(amount for _, amount in normalized) != 0:
+            return None
+        return tuple(sorted(normalized))
+
+    def integrity_report(self) -> LedgerIntegrityReport:
+        """Check persisted transaction structure without mutating the ledger.
+
+        The report combines SQLite's own quick integrity check with application
+        invariants: every transaction has at least two zero-sum postings, no
+        posting is orphaned, and each canonical idempotency payload describes the
+        exact stored postings. Counts are calculated from one read snapshot and
+        amounts are summed in Python to avoid SQLite integer-overflow behavior.
+        """
+        with _connect(self.path) as db:
+            db.execute("BEGIN")
+            sqlite_integrity_ok = all(
+                result == "ok" for (result,) in db.execute("PRAGMA quick_check")
+            )
+            transactions = dict(
+                db.execute("SELECT tx_id, payload FROM transactions ORDER BY tx_id")
+            )
+            posting_rows = db.execute(
+                "SELECT tx_id, account, amount FROM postings ORDER BY tx_id, account"
+            ).fetchall()
+
+        postings_by_transaction: dict[str, list[tuple[str, int]]] = {
+            transaction_id: [] for transaction_id in transactions
+        }
+        orphan_posting_count = 0
+        accounts: set[str] = set()
+        for transaction_id, account, amount in posting_rows:
+            accounts.add(account)
+            if transaction_id not in postings_by_transaction:
+                orphan_posting_count += 1
+                continue
+            postings_by_transaction[transaction_id].append((account, amount))
+
+        invalid_transaction_count = 0
+        malformed_payload_count = 0
+        payload_mismatch_count = 0
+        for transaction_id, payload in transactions.items():
+            postings = postings_by_transaction[transaction_id]
+            if len(postings) < 2 or sum(amount for _, amount in postings) != 0:
+                invalid_transaction_count += 1
+            payload_postings = self._validated_payload_postings(payload)
+            if payload_postings is None:
+                malformed_payload_count += 1
+            elif payload_postings != tuple(postings):
+                payload_mismatch_count += 1
+
+        valid = not any(
+            (
+                not sqlite_integrity_ok,
+                orphan_posting_count,
+                invalid_transaction_count,
+                malformed_payload_count,
+                payload_mismatch_count,
+            )
+        )
+        return LedgerIntegrityReport(
+            valid=valid,
+            sqlite_integrity_ok=sqlite_integrity_ok,
+            transaction_count=len(transactions),
+            posting_count=len(posting_rows),
+            account_count=len(accounts),
+            orphan_posting_count=orphan_posting_count,
+            invalid_transaction_count=invalid_transaction_count,
+            malformed_payload_count=malformed_payload_count,
+            payload_mismatch_count=payload_mismatch_count,
         )
 
     def post(self, tx_id: str, entries: list[tuple[str, int]]) -> bool:

@@ -87,6 +87,54 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.balance("wallet"), 2 * maximum)
         self.assertEqual(self.ledger.balance("missing"), 0)
 
+    def test_integrity_report_validates_one_read_only_snapshot(self):
+        maximum = 2**63 - 1
+        self.ledger.post("fund-a", [("clearing-a", -maximum), ("wallet", maximum)])
+        self.ledger.post("fund-b", [("clearing-b", -maximum), ("wallet", maximum)])
+
+        report = self.ledger.integrity_report()
+
+        self.assertTrue(report.valid)
+        self.assertTrue(report.sqlite_integrity_ok)
+        self.assertEqual(report.transaction_count, 2)
+        self.assertEqual(report.posting_count, 4)
+        self.assertEqual(report.account_count, 3)
+        self.assertEqual(report.orphan_posting_count, 0)
+        self.assertEqual(report.invalid_transaction_count, 0)
+        self.assertEqual(report.malformed_payload_count, 0)
+        self.assertEqual(report.payload_mismatch_count, 0)
+        self.assertEqual(self.ledger.balance("wallet"), 2 * maximum)
+
+    def test_integrity_report_detects_structural_and_payload_corruption(self):
+        self.ledger.post("malformed", [("a", -10), ("b", 10)])
+        self.ledger.post("mismatch", [("a", -20), ("b", 20)])
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute(
+                "UPDATE transactions SET payload = ? WHERE tx_id = ?",
+                ("not-json", "malformed"),
+            )
+            db.execute(
+                "UPDATE postings SET amount = ? WHERE tx_id = ? AND account = ?",
+                (19, "mismatch", "b"),
+            )
+            db.execute(
+                "INSERT INTO postings (tx_id, account, amount) VALUES (?, ?, ?)",
+                ("orphan", "ghost", 1),
+            )
+            db.commit()
+
+        report = self.ledger.integrity_report()
+
+        self.assertFalse(report.valid)
+        self.assertTrue(report.sqlite_integrity_ok)
+        self.assertEqual(report.transaction_count, 2)
+        self.assertEqual(report.posting_count, 5)
+        self.assertEqual(report.account_count, 3)
+        self.assertEqual(report.orphan_posting_count, 1)
+        self.assertEqual(report.invalid_transaction_count, 1)
+        self.assertEqual(report.malformed_payload_count, 1)
+        self.assertEqual(report.payload_mismatch_count, 1)
+
     def test_account_position_is_consistent_and_expires_due_holds(self):
         now = 100
 
