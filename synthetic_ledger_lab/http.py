@@ -163,6 +163,7 @@ def _route(path: str) -> str:
         "/account-statement",
         "/account-position",
         "/account-positions",
+        "/integrity-report",
     }:
         return path
     if path.startswith("/transactions/") and "/" not in path.removeprefix(
@@ -411,6 +412,15 @@ def create_app(
                         "positions": [asdict(item) for item in page.positions],
                         "next_cursor": page.next_cursor,
                     },
+                )
+
+            if path == "/integrity-report":
+                if environ.get("QUERY_STRING"):
+                    raise ValueError("integrity report endpoint does not accept query parameters")
+                return _json_response(
+                    start_response,
+                    "200 OK",
+                    asdict(ledger.integrity_report()),
                 )
 
             if path.startswith("/transactions/"):

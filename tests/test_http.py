@@ -497,6 +497,34 @@ class AuditHttpTests(unittest.TestCase):
                     "400 Bad Request",
                 )
 
+    def test_integrity_report_exposes_bounded_read_only_summary(self):
+        status, _, payload = self.request("/integrity-report")
+
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            payload,
+            {
+                "valid": True,
+                "sqlite_integrity_ok": True,
+                "transaction_count": 1,
+                "posting_count": 2,
+                "account_count": 2,
+                "orphan_posting_count": 0,
+                "invalid_transaction_count": 0,
+                "malformed_payload_count": 0,
+                "payload_mismatch_count": 0,
+            },
+        )
+        self.assertNotIn("fund", json.dumps(payload))
+        self.assertNotIn("wallet", json.dumps(payload))
+
+        status, _, payload = self.request("/integrity-report", query="detail=true")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(
+            payload,
+            {"error": "integrity report endpoint does not accept query parameters"},
+        )
+
     def test_query_validation_is_strict_and_bounded(self):
         cases = [
             ("/transactions", "limit=0", "limit must be"),
@@ -539,6 +567,7 @@ class AuditHttpTests(unittest.TestCase):
             ("/account-statement", "account_statement"),
             ("/holds", "holds"),
             ("/holds/hold-active", "hold"),
+            ("/integrity-report", "integrity_report"),
         ]
         for path, method in cases:
             with self.subTest(path=path), patch.object(

@@ -194,6 +194,7 @@ local demo:
 python3 -m synthetic_ledger_lab.http demo.sqlite3 --host 127.0.0.1 --port 8080
 curl 'http://127.0.0.1:8080/transactions?account=demo-wallet&limit=50'
 curl 'http://127.0.0.1:8080/holds?state=active&limit=50'
+curl 'http://127.0.0.1:8080/integrity-report'
 ```
 
 To exercise the authentication boundary without placing a secret in the command
@@ -215,8 +216,11 @@ non-health request, including failed authentication attempts. The default is
 
 Available routes are `/health`, `/ready`, `/metrics`, `/transactions`,
 `/transactions/{id}`, `/account-statement`, `/account-position`,
-`/account-positions`, `/holds`, and
-`/holds/{id}`. The account-position route requires an `account` query parameter
+`/account-positions`, `/integrity-report`, `/holds`, and
+`/holds/{id}`. The integrity-report route runs the same bounded, aggregate-only
+structural diagnostic as `ledger.integrity_report()` over one read-only snapshot;
+it accepts no query parameters and does not expose transaction or account IDs. The
+account-position route requires an `account` query parameter
 and returns one atomic posted/held/available/policy snapshot. The account-positions
 route returns bounded account-name keyset pages from one snapshot per request. The
 statement route
