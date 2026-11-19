@@ -103,6 +103,11 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(report.invalid_transaction_count, 0)
         self.assertEqual(report.malformed_payload_count, 0)
         self.assertEqual(report.payload_mismatch_count, 0)
+        self.assertEqual(report.hold_count, 0)
+        self.assertEqual(report.invalid_hold_state_count, 0)
+        self.assertEqual(report.active_hold_without_policy_count, 0)
+        self.assertEqual(report.orphan_capture_count, 0)
+        self.assertEqual(report.capture_mismatch_count, 0)
         self.assertEqual(self.ledger.balance("wallet"), 2 * maximum)
 
     def test_integrity_report_detects_structural_and_payload_corruption(self):
@@ -134,6 +139,51 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(report.invalid_transaction_count, 1)
         self.assertEqual(report.malformed_payload_count, 1)
         self.assertEqual(report.payload_mismatch_count, 1)
+
+    def test_integrity_report_validates_hold_lifecycle_and_capture_relationships(self):
+        self.ledger.post("fund", [("clearing", -100), ("wallet", 100)])
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.place_hold("active", "wallet", 10)
+        self.ledger.place_hold("released", "wallet", 20)
+        self.ledger.release_hold("released")
+        self.ledger.place_hold("captured", "wallet", 30)
+        self.ledger.capture_hold("captured", "capture-tx", "merchant")
+
+        report = self.ledger.integrity_report()
+
+        self.assertTrue(report.valid)
+        self.assertEqual(report.hold_count, 3)
+        self.assertEqual(report.invalid_hold_state_count, 0)
+        self.assertEqual(report.active_hold_without_policy_count, 0)
+        self.assertEqual(report.orphan_capture_count, 0)
+        self.assertEqual(report.capture_mismatch_count, 0)
+
+    def test_integrity_report_detects_corrupt_hold_relationships(self):
+        self.ledger.post("fund", [("clearing", -100), ("wallet", 100)])
+        self.ledger.post("unrelated", [("wallet", -5), ("merchant", 5)])
+        self.ledger.set_minimum_balance("wallet", 0)
+        with closing(sqlite3.connect(self.path)) as db:
+            db.executemany(
+                """INSERT INTO account_holds
+                   (hold_id, account, amount, active, captured_tx_id, expired_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    ("bad-state", "wallet", 1, 0, None, 10),
+                    ("missing-policy", "unknown", 1, 1, None, None),
+                    ("orphan-capture", "wallet", 2, 0, "missing", None),
+                    ("wrong-capture", "wallet", 7, 0, "unrelated", None),
+                ],
+            )
+            db.commit()
+
+        report = self.ledger.integrity_report()
+
+        self.assertFalse(report.valid)
+        self.assertEqual(report.hold_count, 4)
+        self.assertEqual(report.invalid_hold_state_count, 1)
+        self.assertEqual(report.active_hold_without_policy_count, 1)
+        self.assertEqual(report.orphan_capture_count, 1)
+        self.assertEqual(report.capture_mismatch_count, 1)
 
     def test_account_position_is_consistent_and_expires_due_holds(self):
         now = 100
