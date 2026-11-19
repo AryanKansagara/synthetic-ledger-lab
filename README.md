@@ -177,12 +177,15 @@ integers.
 For a read-only structural diagnostic, `ledger.integrity_report()` checks one
 SQLite snapshot with `PRAGMA quick_check`, verifies that every transaction has at
 least two zero-sum postings, detects orphan postings, and compares each canonical
-idempotency payload with the exact persisted posting set. The report includes
-bounded aggregate counts rather than transaction or account identifiers, and all
-amount summation occurs in Python to avoid SQLite aggregate overflow. This is an
-application-integrity diagnostic for a local synthetic ledger, not an external
-reconciliation, financial audit, proof of correctness, or guarantee against a
-malicious database writer.
+idempotency payload with the exact persisted posting set. It also checks that
+active, released, expired, and captured hold states do not conflict; active holds
+retain a minimum-balance policy; and each captured hold points to the matching
+two-posting transfer. The report includes bounded aggregate counts rather than
+transaction, hold, or account identifiers, and all amount summation occurs in
+Python to avoid SQLite aggregate overflow. This is an application-integrity
+diagnostic for a local synthetic ledger, not an external reconciliation,
+financial audit, proof of correctness, or guarantee against a malicious database
+writer.
 
 ## Local read-only audit API
 

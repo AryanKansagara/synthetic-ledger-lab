@@ -513,6 +513,11 @@ class AuditHttpTests(unittest.TestCase):
                 "invalid_transaction_count": 0,
                 "malformed_payload_count": 0,
                 "payload_mismatch_count": 0,
+                "hold_count": 1,
+                "invalid_hold_state_count": 0,
+                "active_hold_without_policy_count": 0,
+                "orphan_capture_count": 0,
+                "capture_mismatch_count": 0,
             },
         )
         self.assertNotIn("fund", json.dumps(payload))
