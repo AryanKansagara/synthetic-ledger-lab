@@ -120,6 +120,8 @@ class LedgerIntegrityReport:
     invalid_transaction_count: int
     malformed_payload_count: int
     payload_mismatch_count: int
+    policy_count: int
+    policy_violation_count: int
     hold_count: int
     invalid_hold_state_count: int
     active_hold_without_policy_count: int
@@ -714,9 +716,10 @@ class Ledger:
         The report combines SQLite's own quick integrity check with application
         invariants: every transaction has at least two zero-sum postings, no
         posting is orphaned, each canonical idempotency payload describes the
-        exact stored postings, and hold lifecycle/capture relationships are
-        internally consistent. Counts are calculated from one read snapshot and
-        amounts are summed in Python to avoid SQLite integer-overflow behavior.
+        exact stored postings, persisted minimum-balance policies remain satisfied,
+        and hold lifecycle/capture relationships are internally consistent. Counts
+        are calculated from one read snapshot and amounts are summed in Python to
+        avoid SQLite integer-overflow behavior.
         """
         with _connect(self.path) as db:
             db.execute("BEGIN")
@@ -734,10 +737,12 @@ class Ledger:
                           expires_at, expired_at
                    FROM account_holds ORDER BY hold_id"""
             ).fetchall()
-            policy_accounts = {
-                account
-                for (account,) in db.execute("SELECT account FROM account_policies")
-            }
+            policies = dict(
+                db.execute(
+                    "SELECT account, minimum_balance FROM account_policies "
+                    "ORDER BY account"
+                )
+            )
 
         postings_by_transaction: dict[str, list[tuple[str, int]]] = {
             transaction_id: [] for transaction_id in transactions
@@ -768,6 +773,7 @@ class Ledger:
         active_hold_without_policy_count = 0
         orphan_capture_count = 0
         capture_mismatch_count = 0
+        active_holds_by_account: dict[str, int] = {}
         for (
             _hold_id,
             account,
@@ -781,6 +787,10 @@ class Ledger:
             captured_state = captured_transaction_id is not None
             expired_state = expired_at is not None
             if active_state:
+                active_holds_by_account[account] = (
+                    active_holds_by_account.get(account, 0) + amount
+                )
+            if active_state:
                 lifecycle_valid = not captured_state and not expired_state
             elif captured_state:
                 lifecycle_valid = not expired_state
@@ -790,7 +800,7 @@ class Ledger:
                 lifecycle_valid = True
             if not lifecycle_valid:
                 invalid_hold_state_count += 1
-            if active_state and account not in policy_accounts:
+            if active_state and account not in policies:
                 active_hold_without_policy_count += 1
             if captured_state:
                 capture_postings = postings_by_transaction.get(captured_transaction_id)
@@ -803,6 +813,16 @@ class Ledger:
                 ):
                     capture_mismatch_count += 1
 
+        posted_balances: dict[str, int] = {}
+        for _transaction_id, account, amount in posting_rows:
+            posted_balances[account] = posted_balances.get(account, 0) + amount
+        policy_violation_count = sum(
+            posted_balances.get(account, 0)
+            - active_holds_by_account.get(account, 0)
+            < minimum_balance
+            for account, minimum_balance in policies.items()
+        )
+
         valid = not any(
             (
                 not sqlite_integrity_ok,
@@ -810,6 +830,7 @@ class Ledger:
                 invalid_transaction_count,
                 malformed_payload_count,
                 payload_mismatch_count,
+                policy_violation_count,
                 invalid_hold_state_count,
                 active_hold_without_policy_count,
                 orphan_capture_count,
@@ -826,6 +847,8 @@ class Ledger:
             invalid_transaction_count=invalid_transaction_count,
             malformed_payload_count=malformed_payload_count,
             payload_mismatch_count=payload_mismatch_count,
+            policy_count=len(policies),
+            policy_violation_count=policy_violation_count,
             hold_count=len(hold_rows),
             invalid_hold_state_count=invalid_hold_state_count,
             active_hold_without_policy_count=active_hold_without_policy_count,

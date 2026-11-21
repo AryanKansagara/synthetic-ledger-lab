@@ -513,6 +513,8 @@ class AuditHttpTests(unittest.TestCase):
                 "invalid_transaction_count": 0,
                 "malformed_payload_count": 0,
                 "payload_mismatch_count": 0,
+                "policy_count": 1,
+                "policy_violation_count": 0,
                 "hold_count": 1,
                 "invalid_hold_state_count": 0,
                 "active_hold_without_policy_count": 0,
