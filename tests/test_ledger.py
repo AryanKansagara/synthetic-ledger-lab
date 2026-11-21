@@ -103,6 +103,8 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(report.invalid_transaction_count, 0)
         self.assertEqual(report.malformed_payload_count, 0)
         self.assertEqual(report.payload_mismatch_count, 0)
+        self.assertEqual(report.policy_count, 0)
+        self.assertEqual(report.policy_violation_count, 0)
         self.assertEqual(report.hold_count, 0)
         self.assertEqual(report.invalid_hold_state_count, 0)
         self.assertEqual(report.active_hold_without_policy_count, 0)
@@ -153,6 +155,8 @@ class LedgerTests(unittest.TestCase):
 
         self.assertTrue(report.valid)
         self.assertEqual(report.hold_count, 3)
+        self.assertEqual(report.policy_count, 1)
+        self.assertEqual(report.policy_violation_count, 0)
         self.assertEqual(report.invalid_hold_state_count, 0)
         self.assertEqual(report.active_hold_without_policy_count, 0)
         self.assertEqual(report.orphan_capture_count, 0)
@@ -184,6 +188,24 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(report.active_hold_without_policy_count, 1)
         self.assertEqual(report.orphan_capture_count, 1)
         self.assertEqual(report.capture_mismatch_count, 1)
+
+    def test_integrity_report_detects_policy_broken_by_persisted_state(self):
+        self.ledger.post("fund", [("clearing", -100), ("wallet", 100)])
+        self.ledger.set_minimum_balance("wallet", 0)
+        self.ledger.place_hold("reserved", "wallet", 25)
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute(
+                "UPDATE account_policies SET minimum_balance = ? WHERE account = ?",
+                (76, "wallet"),
+            )
+            db.commit()
+
+        report = self.ledger.integrity_report()
+
+        self.assertFalse(report.valid)
+        self.assertEqual(report.policy_count, 1)
+        self.assertEqual(report.policy_violation_count, 1)
+        self.assertEqual(report.active_hold_without_policy_count, 0)
 
     def test_account_position_is_consistent_and_expires_due_holds(self):
         now = 100
